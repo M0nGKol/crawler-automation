@@ -1,0 +1,15 @@
+.env
+.env.*
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+crawler.db
+output/
+node_modules/
+.git/
+.DS_Store

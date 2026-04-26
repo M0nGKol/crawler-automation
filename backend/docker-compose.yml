@@ -1,0 +1,15 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: healthcare-crawler-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./crawler.db:/app/crawler.db
+      - ./output:/app/output
+      - ./config:/app/config:ro
+    restart: unless-stopped
