@@ -9,7 +9,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 crawler.db
-output/
+output/*.csv
 node_modules/
 .git/
 .DS_Store
