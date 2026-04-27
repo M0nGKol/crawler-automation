@@ -4,6 +4,8 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+load_dotenv()
 from typing import Any
 from urllib.parse import urlencode
 
@@ -21,13 +23,16 @@ log = logging.getLogger(__name__)
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
 # Accept either GOOGLE_OAUTH_REDIRECT_URI or the shorter REDIRECT_URI alias.
-# Production default ensures the OAuth flow always uses the Render URL even if
-# the env var is accidentally omitted on the server.
 GOOGLE_OAUTH_REDIRECT_URI = (
     os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
     or os.getenv("REDIRECT_URI")
-    or "https://crawler-automation-1.onrender.com/auth/google/callback"
 )
+
+if not GOOGLE_OAUTH_REDIRECT_URI:
+    raise RuntimeError("GOOGLE_OAUTH_REDIRECT_URI environment variable is not set!")
+
+log.info(f"[AUTH STARTUP] GOOGLE_OAUTH_REDIRECT_URI = {GOOGLE_OAUTH_REDIRECT_URI}")
+
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
 JWT_SECRET = os.getenv("NEXTAUTH_SECRET", "")
 JWT_ALGORITHM = "HS256"
