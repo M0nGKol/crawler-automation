@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, text
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship, sessionmaker
+
+log = logging.getLogger(__name__)
 
 DATABASE_URL = "sqlite:///./crawler.db"
 
@@ -42,14 +45,45 @@ class RunLog(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
     sites_attempted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     sites_succeeded: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sites_failed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     listings_scraped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     listings_masked: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    jobs_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     errors: Mapped[str] = mapped_column(Text, default="", nullable=False)
     sheet_url: Mapped[str | None] = mapped_column(String, nullable=True)
 
     user: Mapped[User | None] = relationship("User", back_populates="run_logs")
+
+
+class JobHash(Base):
+    """Stores MD5 hashes of scraped jobs to enable cross-run deduplication."""
+
+    __tablename__ = "job_hashes"
+
+    hash: Mapped[str] = mapped_column(String, primary_key=True)
+    source: Mapped[str] = mapped_column(String, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ScraperSite(Base):
+    """Tracks all scraper sites (default + custom) with per-user overrides."""
+
+    __tablename__ = "scraper_sites"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    site_name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    url: Mapped[str] = mapped_column(String, default="", nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    last_status: Mapped[str] = mapped_column(String, default="unknown", nullable=False)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
+
+    user: Mapped[User | None] = relationship("User")
 
 
 def get_db():
@@ -60,5 +94,26 @@ def get_db():
         db.close()
 
 
+# ── SQLite migration helpers ──────────────────────────────────────────────
+_RUN_LOG_MIGRATIONS = [
+    "ALTER TABLE run_logs ADD COLUMN status TEXT DEFAULT 'pending'",
+    "ALTER TABLE run_logs ADD COLUMN sites_failed INTEGER DEFAULT 0",
+    "ALTER TABLE run_logs ADD COLUMN jobs_found INTEGER DEFAULT 0",
+]
+
+
+def _run_migrations(conn) -> None:  # type: ignore[no-untyped-def]
+    """Apply ALTER TABLE migrations that SQLite's create_all won't handle."""
+    for stmt in _RUN_LOG_MIGRATIONS:
+        try:
+            conn.execute(text(stmt))
+            conn.commit()
+        except Exception:
+            # Column already exists — safe to ignore
+            pass
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        _run_migrations(conn)
