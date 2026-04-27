@@ -7,34 +7,33 @@ export default function OnboardingCallbackPage() {
   const router = useRouter();
 
   useEffect(() => {
-    const url = new URL(window.location.href);
-    const success = url.searchParams.get("success") === "true";
-    const sheetUrl = url.searchParams.get("sheet_url");
-    const error = url.searchParams.get("error");
-    const token = url.searchParams.get("token");
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("token");
+    const success = params.get("success");
+    const error = params.get("error");
+    const userId = params.get("user_id");
 
-    // If opened as a popup, post message back and close
-    if (window.opener) {
-      if (success) {
-        window.opener.postMessage({ success: true, sheet_url: sheetUrl }, "*");
-      } else {
-        window.opener.postMessage({ success: false, error }, "*");
-      }
-      const timeout = setTimeout(() => window.close(), 500);
-      return () => clearTimeout(timeout);
+    if (error) {
+      console.error("OAuth error:", error);
+      router.push("/onboarding?error=" + error);
+      return;
     }
 
-    // If opened as a full page redirect (default OAuth flow)
     if (token) {
       localStorage.setItem("auth_token", token);
+      if (userId) localStorage.setItem("user_id", userId);
     }
 
-    if (success || token) {
+    if (success === "true" || token) {
       router.push("/dashboard");
     } else {
       router.push("/onboarding?error=auth_failed");
     }
   }, [router]);
 
-  return <main className="p-6">Completing onboarding...</main>;
+  return (
+    <div className="flex items-center justify-center min-h-screen bg-black text-white">
+      <p>Completing onboarding...</p>
+    </div>
+  );
 }

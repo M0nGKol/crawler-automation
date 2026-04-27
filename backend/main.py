@@ -267,12 +267,13 @@ async def auth_google_callback(
         )
 
         jwt_token = create_jwt(user.id)
+        
         url = (
             f"{FRONTEND_URL}/onboarding/callback?success=true"
-            f"&sheet_url={urllib.parse.quote(workspace['sheet_url'], safe='')}"
-            f"&sheet_title={urllib.parse.quote(workspace['sheet_title'], safe='')}"
             f"&token={jwt_token}"
             f"&user_id={user.id}"
+            f"&sheet_url={urllib.parse.quote(workspace['sheet_url'], safe='')}"
+            f"&sheet_title={urllib.parse.quote(workspace['sheet_title'], safe='')}"
         )
         return RedirectResponse(url=url)
     except Exception as exc:
