@@ -427,7 +427,11 @@ def status(authorization: str | None = Header(default=None), db: Session = Depen
         .all()
     )
     last = runs[0] if runs else None
-    return {"ok": True, "last_run": last.started_at.isoformat() if last and last.started_at else None}
+    return {
+        "status": "ok",
+        "user_id": user.id,
+        "last_run": last.started_at.isoformat() if last and last.started_at else None,
+    }
 
 
 @app.get("/logs")
