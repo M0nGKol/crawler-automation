@@ -38,7 +38,12 @@ def _get_or_create_tab(
         return ws
     except Exception as not_found:
         # gspread raises WorksheetNotFound — create a fresh tab
-        if "not found" in str(not_found).lower() or "worksheet" in str(not_found).lower():
+        # Note: The exception string might just be the tab name (e.g., "raw_data"),
+        # so we also check the class name.
+        err_str = str(not_found).lower()
+        class_name = not_found.__class__.__name__.lower()
+        
+        if "not found" in err_str or "worksheet" in err_str or "notfound" in class_name:
             ws = ss.add_worksheet(tab_name, rows=5000, cols=len(headers))
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return ws

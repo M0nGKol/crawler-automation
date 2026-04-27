@@ -250,27 +250,37 @@ async def run_pipeline(
 
     # Dedup (in-run + cross-run via DB)
     jobs, _removed = deduplicate_jobs(jobs)
+    log.info(f"[PIPELINE] After dedup: {len(jobs)} jobs")
 
     # Deadline filter
     jobs = [job for job in jobs if is_within_deadline(job)]
+    log.info(f"[PIPELINE] After deadline filter: {len(jobs)} jobs")
 
     # Mask sensitive fields
     jobs = mask_jobs(jobs, claude=claude, masking_limit=settings.masking_limit)
+    log.info(f"[PIPELINE] After masking: {len(jobs)} jobs")
 
     # Build output models (Task 5)
     jobs_raw, jobs_masked = _build_output_models(jobs)
+    log.info(f"[PIPELINE] After model build: {len(jobs_raw)} raw, {len(jobs_masked)} masked")
 
     # Write CSV (Task 4)
     raw_csv, masked_csv = save_csv(jobs_raw, jobs_masked, str(settings.output_dir))
 
     # Write Sheets (Task 3)
-    sheet_url = write_to_sheets(
-        jobs_raw,
-        jobs_masked,
-        sheet_id=settings.sheet_id,
-        creds_path=settings.creds_path,
-        user_id=user_id,
-    )
+    log.info(f"[PIPELINE] Calling write_to_sheets with user_id: {user_id}")
+    try:
+        sheet_url = write_to_sheets(
+            jobs_raw,
+            jobs_masked,
+            sheet_id=settings.sheet_id,
+            creds_path=settings.creds_path,
+            user_id=user_id,
+        )
+        log.info(f"[PIPELINE] Sheets write completed, url: {sheet_url}")
+    except Exception as e:
+        log.error(f"[PIPELINE] write_to_sheets failed: {e}", exc_info=True)
+        sheet_url = None
 
     elapsed = time.monotonic() - start
     return {
