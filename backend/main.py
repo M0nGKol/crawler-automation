@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,7 @@ _env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(_env_path)
 
 import yaml
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, HttpUrl
@@ -38,10 +39,11 @@ from auth import (
     verify_jwt,
     verify_password,
 )
-from database import RunLog, User, get_db, init_db
-from app.config import merge_sites, parse_sites_yaml
+from database import RunLog, ScraperSite, SessionLocal, User, get_db, init_db
+from app.config import load_sites_config, merge_sites, parse_sites_yaml
 from mvp import run_scraper
 from onboarding import setup_new_user_workspace
+from pipeline import run_pipeline
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 _oauth_states: dict[str, float] = {}
@@ -50,6 +52,16 @@ _oauth_states: dict[str, float] = {}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # Seed default scraper sites on startup
+    try:
+        from app.config import load_sites_config
+        from pathlib import Path
+        default_sites = load_sites_config(Path("config/sites.yaml"))
+        from pipeline import _seed_scraper_sites
+        _seed_scraper_sites(default_sites)
+    except Exception as _seed_err:
+        import logging
+        logging.getLogger(__name__).warning("Site seeding failed: %s", _seed_err)
     yield
 
 
@@ -101,6 +113,16 @@ class AddSiteRequest(BaseModel):
     type: str = "job_board"
     mode: str = "claude_fallback"
     site_id: str | None = None
+
+
+class NewSiteRequest(BaseModel):
+    """Request body for POST /sites/add (DB-backed sites API)."""
+    url: str
+    site_name: str
+
+
+class SiteToggleRequest(BaseModel):
+    is_active: bool
 
 
 def _slugify_site_name(raw: str) -> str:
@@ -305,11 +327,13 @@ def auth_sheets_status(
 
 
 @app.post("/run")
-def run_pipeline(
+async def run_pipeline_endpoint(
     payload: RunRequest,
+    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    """Start pipeline in background. Returns run_id immediately for polling."""
     user: User | None = None
     if authorization and authorization.startswith("Bearer "):
         token = authorization.replace("Bearer ", "", 1).strip()
@@ -320,29 +344,69 @@ def run_pipeline(
         user = db.query(User).filter(User.id == payload.user_id).first()
 
     run_log = RunLog(
+        id=uuid.uuid4().hex,
         user_id=user.id if user else None,
         started_at=datetime.now(timezone.utc),
         trigger="api",
+        status="running",
     )
     db.add(run_log)
     db.commit()
     db.refresh(run_log)
+    run_id = run_log.id
 
-    try:
-        result = run_scraper(user_id=user.id if user else None)
-        run_log.finished_at = datetime.now(timezone.utc)
-        run_log.sites_attempted = result.get("sites_attempted", 0)
-        run_log.sites_succeeded = result.get("sites_succeeded", 0)
-        run_log.listings_scraped = result.get("count", 0)
-        run_log.listings_masked = result.get("count", 0)
-        run_log.sheet_url = result.get("sheet_url")
-        db.commit()
-        return result
-    except Exception as exc:
-        run_log.finished_at = datetime.now(timezone.utc)
-        run_log.errors = str(exc)
-        db.commit()
-        raise
+    async def _run_in_background() -> None:
+        """Execute the pipeline and update the run_log when done."""
+        _db = SessionLocal()
+        try:
+            result = await run_pipeline(user_id=user.id if user else None, run_id=run_id)
+            _log = _db.query(RunLog).filter(RunLog.id == run_id).first()
+            if _log:
+                _log.finished_at = datetime.now(timezone.utc)
+                _log.status = "completed"
+                _log.sites_attempted = result.get("sites_attempted", 0)
+                _log.sites_succeeded = result.get("sites_succeeded", 0)
+                _log.sites_failed = result.get("sites_failed", 0)
+                _log.listings_scraped = result.get("count", 0)
+                _log.listings_masked = result.get("count", 0)
+                _log.jobs_found = result.get("count", 0)
+                _log.sheet_url = result.get("sheet_url")
+                _db.commit()
+        except Exception as exc:
+            _log = _db.query(RunLog).filter(RunLog.id == run_id).first()
+            if _log:
+                _log.finished_at = datetime.now(timezone.utc)
+                _log.status = "failed"
+                _log.errors = str(exc)
+                _db.commit()
+        finally:
+            _db.close()
+
+    background_tasks.add_task(_run_in_background)
+    return {"run_id": run_id, "status": "started"}
+
+
+@app.get("/run/{run_id}")
+def get_run_status(
+    run_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Poll the status of a pipeline run."""
+    row = db.query(RunLog).filter(RunLog.id == run_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {
+        "run_id": row.id,
+        "status": getattr(row, "status", "unknown"),
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.finished_at.isoformat() if row.finished_at else None,
+        "jobs_found": getattr(row, "jobs_found", 0),
+        "sites_succeeded": row.sites_succeeded,
+        "sites_failed": getattr(row, "sites_failed", 0),
+        "sheet_url": row.sheet_url,
+        "errors": row.errors,
+    }
+
 
 
 @app.get("/status")
@@ -462,6 +526,107 @@ def export_data(authorization: str | None = Header(default=None), db: Session = 
     return {
         "sheet_url": f"https://docs.google.com/spreadsheets/d/{user.sheet_id}" if user.sheet_id else None,
         "sheet_id": user.sheet_id,
+    }
+
+
+# ── New DB-backed sites API (Task 8) ─────────────────────────────────────────
+
+@app.post("/sites/add")
+def add_custom_site(
+    payload: NewSiteRequest,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Add a user-defined custom site to the DB."""
+    user = _require_user_from_jwt(authorization, db)
+    # Check for duplicate site_name
+    existing = db.query(ScraperSite).filter(ScraperSite.site_name == payload.site_name).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="site_name already exists")
+    site = ScraperSite(
+        id=uuid.uuid4().hex,
+        site_name=payload.site_name,
+        url=str(payload.url),
+        is_default=False,
+        is_active=True,
+        last_status="unknown",
+        user_id=user.id,
+    )
+    db.add(site)
+    db.commit()
+    db.refresh(site)
+    return _format_site(site)
+
+
+@app.get("/sites/list")
+def list_sites(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return all default sites + the current user's custom sites."""
+    user = _require_user_from_jwt(authorization, db)
+    rows = (
+        db.query(ScraperSite)
+        .filter(
+            (ScraperSite.is_default.is_(True))
+            | (ScraperSite.user_id == user.id)
+        )
+        .order_by(ScraperSite.is_default.desc(), ScraperSite.site_name)
+        .all()
+    )
+    return {"sites": [_format_site(r) for r in rows]}
+
+
+@app.put("/sites/{site_id}/toggle")
+def toggle_site(
+    site_id: str,
+    payload: SiteToggleRequest,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Toggle is_active for any site the user can see."""
+    user = _require_user_from_jwt(authorization, db)
+    site = db.query(ScraperSite).filter(ScraperSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    # Allow toggling default sites and user's own custom sites
+    if not site.is_default and site.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorised")
+    site.is_active = payload.is_active
+    db.commit()
+    db.refresh(site)
+    return _format_site(site)
+
+
+@app.delete("/sites/{site_id}")
+def delete_custom_site(
+    site_id: str,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Delete a custom (non-default) site. Default sites cannot be deleted."""
+    user = _require_user_from_jwt(authorization, db)
+    site = db.query(ScraperSite).filter(ScraperSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    if site.is_default:
+        raise HTTPException(status_code=403, detail="Cannot delete default sites")
+    if site.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorised")
+    db.delete(site)
+    db.commit()
+    return {"message": "Site deleted"}
+
+
+def _format_site(site: ScraperSite) -> dict[str, Any]:
+    return {
+        "id": site.id,
+        "site_name": site.site_name,
+        "url": site.url,
+        "is_default": site.is_default,
+        "is_active": site.is_active,
+        "last_status": site.last_status,
+        "last_run_at": site.last_run_at.isoformat() if site.last_run_at else None,
     }
 
 
