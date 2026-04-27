@@ -14,9 +14,20 @@ from cryptography.fernet import Fernet
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from jose import JWTError, jwt
+import logging
+
+log = logging.getLogger(__name__)
+
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
-GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
+# Accept either GOOGLE_OAUTH_REDIRECT_URI or the shorter REDIRECT_URI alias.
+# Production default ensures the OAuth flow always uses the Render URL even if
+# the env var is accidentally omitted on the server.
+GOOGLE_OAUTH_REDIRECT_URI = (
+    os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+    or os.getenv("REDIRECT_URI")
+    or "https://crawler-automation-1.onrender.com/auth/google/callback"
+)
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
 JWT_SECRET = os.getenv("NEXTAUTH_SECRET", "")
 JWT_ALGORITHM = "HS256"
@@ -51,6 +62,8 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def get_google_auth_url(state: str) -> str:
+    # Diagnostic: visible in Render logs after triggering OAuth
+    log.info("Using redirect_uri: %s", GOOGLE_OAUTH_REDIRECT_URI)
     query = urlencode(
         {
             "client_id": GOOGLE_OAUTH_CLIENT_ID,

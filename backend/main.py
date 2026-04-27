@@ -69,10 +69,13 @@ app = FastAPI(title="Health Care Crawler API", lifespan=lifespan)
 
 # ── CORS ────────────────────────────────────────────────────────────────
 _allowed_origins = [o for o in [
-    FRONTEND_URL,
-    os.getenv("NEXTAUTH_URL", ""),
-    "http://localhost:3000",
+    FRONTEND_URL,                                           # e.g. https://crawler-automation.vercel.app
+    os.getenv("NEXTAUTH_URL", ""),                         # mirror of FRONTEND_URL used by NextAuth
+    "https://crawler-automation.vercel.app",               # explicit production fallback
+    "https://crawler-automation-1.onrender.com",           # Render backend (for same-origin browser calls)
+    "http://localhost:3000",                               # local dev only
 ] if o]
+
 
 app.add_middleware(
     CORSMiddleware,
