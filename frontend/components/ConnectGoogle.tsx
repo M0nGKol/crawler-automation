@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { apiFetch, getGoogleAuthUrl, getMe, getSheetsStatus, getStoredToken } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 
 type ConnectionState = {
@@ -12,8 +13,6 @@ type ConnectionState = {
   role?: string;
   last_login?: string | null;
 };
-
-const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "";
 
 function getUserId(): string | null {
   if (typeof window === "undefined") return null;
@@ -42,21 +41,13 @@ export default function ConnectGoogle() {
   const [testResult, setTestResult] = useState<string>("");
 
   const refreshStatus = useCallback(async () => {
-    const userId = await ensureUserId();
-    if (!userId) {
+    const token = getStoredToken();
+    if (!token) {
       setStatus({ connected: false });
       return;
     }
     try {
-      const res = await fetch(`${backendUrl}/auth/me`, {
-        headers: { Authorization: `Bearer ${userId}` },
-        cache: "no-store",
-      });
-      if (!res.ok) {
-        setStatus({ connected: false });
-        return;
-      }
-      const data = await res.json();
+      const data = await getMe(token);
       setStatus({
         connected: Boolean(data.sheet_id),
         email: data.email,
@@ -90,11 +81,8 @@ export default function ConnectGoogle() {
     setTestResult("");
     try {
       const userId = await ensureUserId();
-      const url = userId
-        ? `/api/auth/connect-sheets?user_id=${encodeURIComponent(userId)}`
-        : "/api/auth/connect-sheets";
-      const res = await fetch(url);
-      const data = await res.json();
+      if (!userId) throw new Error("Missing user id");
+      const data = await getGoogleAuthUrl(userId);
       if (!data.auth_url) throw new Error("No auth URL returned");
       window.open(data.auth_url, "google-oauth", "width=500,height=600");
     } finally {
@@ -105,14 +93,10 @@ export default function ConnectGoogle() {
   const disconnect = async () => {
     setLoading(true);
     try {
-      const userId = await ensureUserId();
-      if (!userId) return;
-      await fetch(`${backendUrl}/auth/disconnect`, {
+      const token = getStoredToken();
+      if (!token) return;
+      await apiFetch("/auth/disconnect", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${userId}`,
-        },
       });
       await refreshStatus();
     } finally {
@@ -123,16 +107,12 @@ export default function ConnectGoogle() {
   const testConnection = async () => {
     setLoading(true);
     try {
-      const userId = await ensureUserId();
-      if (!userId) {
+      const token = getStoredToken();
+      if (!token) {
         setTestResult(t("config.notConnected"));
         return;
       }
-      const res = await fetch(`${backendUrl}/auth/sheets/status`, {
-        headers: { Authorization: `Bearer ${userId}` },
-        cache: "no-store",
-      });
-      const data = await res.json();
+      const data = await getSheetsStatus(token);
       if (!data.connected) {
         setTestResult(t("config.notConnected"));
         return;

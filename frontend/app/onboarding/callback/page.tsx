@@ -3,6 +3,8 @@
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 
+import { setStoredToken } from "@/lib/api";
+
 export default function OnboardingCallbackPage() {
   const router = useRouter();
 
@@ -20,7 +22,7 @@ export default function OnboardingCallbackPage() {
     }
 
     if (token) {
-      localStorage.setItem("auth_token", token);
+      setStoredToken(token);
       if (userId) localStorage.setItem("user_id", userId);
     }
 

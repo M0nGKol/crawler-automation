@@ -19,8 +19,12 @@ export default function Sidebar({ children }: { children: React.ReactNode }) {
   const { t } = useLocale();
 
   const handleLogout = () => {
+    localStorage.removeItem("auth_token");
     localStorage.removeItem("crawler_token");
+    localStorage.removeItem("token");
     localStorage.removeItem("crawler_user_id");
+    localStorage.removeItem("backend_user_id");
+    localStorage.removeItem("user_id");
     document.cookie = "crawler_token=; Path=/; Max-Age=0";
     router.push("/login");
   };
