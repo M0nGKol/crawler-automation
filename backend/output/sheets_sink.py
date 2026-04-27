@@ -67,6 +67,9 @@ def write_to_sheets(
 
     Returns the spreadsheet URL or None on failure.
     """
+    log.info(f"[SHEETS] Starting write - requested sheet_id: {sheet_id}, user_id: {user_id}")
+    log.info(f"[SHEETS] Jobs to write - raw: {len(jobs_raw)}, masked: {len(jobs_masked)}")
+    
     effective_sheet_id = sheet_id
     gc = None
 
@@ -77,6 +80,11 @@ def write_to_sheets(
             if user and user.google_token and user.sheet_id:
                 gc = get_google_sheets_client(user.google_token)
                 effective_sheet_id = user.sheet_id
+                log.info(f"[SHEETS] Loaded credentials for user {user_id}. Using sheet {effective_sheet_id}")
+            else:
+                log.warning(f"[SHEETS] User {user_id} found but missing token or sheet_id")
+        except Exception as e:
+            log.error(f"[SHEETS] Error loading user credentials: {e}")
         finally:
             db.close()
 
@@ -84,7 +92,11 @@ def write_to_sheets(
         effective_sheet_id = os.getenv("SHEET_DEFAULT", "")
 
     if not effective_sheet_id:
-        log.info("━━ GOOGLE_SHEET_ID not set — skipping Sheets upload")
+        log.error("[SHEETS] No spreadsheet_id provided - skipping")
+        return None
+
+    if not gc and not creds_path:
+        log.error("[SHEETS] No credentials provided - skipping")
         return None
 
     try:
@@ -126,13 +138,15 @@ def write_to_sheets(
             log.info("━━ masked_data tab: no new rows to append (all duplicates)")
 
         sheet_url = f"https://docs.google.com/spreadsheets/d/{effective_sheet_id}"
-        log.info("   %s", sheet_url)
+        log.info(f"[SHEETS] Successfully wrote {len(new_raw_rows)} raw rows and {len(new_masked_rows)} masked rows")
+        log.info(f"[SHEETS] URL: {sheet_url}")
         return sheet_url
 
     except ImportError:
-        log.warning("gspread not installed — run: pip install gspread google-auth")
+        log.warning("[SHEETS] gspread not installed — run: pip install gspread google-auth")
     except Exception as exc:
-        log.error("Sheets upload failed: %s", exc)
+        log.error(f"[SHEETS] Failed to write: {exc}", exc_info=True)
+        raise
     return None
 
 
