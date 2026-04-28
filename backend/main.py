@@ -655,10 +655,48 @@ def _format_site(site: ScraperSite) -> dict[str, Any]:
         "is_default": site.is_default,
         "is_active": site.is_active,
         "last_status": site.last_status,
+        "last_job_count": getattr(site, "last_job_count", 0),
+        "consecutive_failures": getattr(site, "consecutive_failures", 0),
         "last_run_at": site.last_run_at.isoformat() if site.last_run_at else None,
+    }
+
+
+def _get_last_run_summary(db: Session) -> dict[str, Any] | None:
+    row = db.query(RunLog).order_by(RunLog.started_at.desc()).first()
+    if not row:
+        return None
+    return {
+        "run_id": row.id,
+        "status": getattr(row, "status", "unknown"),
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        "sites_attempted": row.sites_attempted,
+        "sites_succeeded": row.sites_succeeded,
+        "sites_failed": getattr(row, "sites_failed", 0),
+        "jobs_found": getattr(row, "jobs_found", 0),
+        "sheet_url": row.sheet_url,
     }
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/sites")
+def site_health(db: Session = Depends(get_db)) -> dict[str, Any]:
+    rows = db.query(ScraperSite).order_by(ScraperSite.is_default.desc(), ScraperSite.site_name).all()
+    return {
+        "last_run": _get_last_run_summary(db),
+        "sites": [
+            {
+                "name": row.site_name,
+                "last_status": row.last_status,
+                "last_job_count": getattr(row, "last_job_count", 0),
+                "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+                "consecutive_failures": getattr(row, "consecutive_failures", 0),
+                "active": row.is_active,
+            }
+            for row in rows
+        ],
+    }
