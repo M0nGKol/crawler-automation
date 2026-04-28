@@ -101,8 +101,8 @@ export default function OnboardingPage() {
     setError("");
     setLoading(true);
     try {
-      const data = await getGoogleAuthUrl(userId);
-      window.open(data.auth_url, "google-auth", "width=500,height=600");
+      const data = await getGoogleAuthUrl(userId, "/onboarding");
+      window.location.href = data.auth_url;
     } catch (err) {
       setError(err instanceof Error ? err.message : t("onboarding.error.google"));
     } finally {

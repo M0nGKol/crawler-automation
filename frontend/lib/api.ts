@@ -83,8 +83,10 @@ export async function getMe(token: string) {
   return res.json();
 }
 
-export async function getGoogleAuthUrl(userId: string) {
-  const res = await apiFetch(`/auth/google?user_id=${encodeURIComponent(userId)}`, {
+export async function getGoogleAuthUrl(userId: string, returnTo?: string) {
+  const query = new URLSearchParams({ user_id: userId });
+  if (returnTo) query.set("return_to", returnTo);
+  const res = await apiFetch(`/auth/google?${query.toString()}`, {
     cache: "no-store",
   });
   if (!res.ok) throw new Error("Failed to fetch Google OAuth URL");
