@@ -22,6 +22,8 @@ pip install -r backend/requirements.txt
 python -m playwright install chromium
 ```
 
+All `pip` installs should happen inside `backend/venv`.
+
 ## 2) Configure environment variables
 
 Copy `backend/.env.example` to `backend/.env`, then fill values:
@@ -32,6 +34,8 @@ cp backend/.env.example backend/.env
 # API + auth
 NEXTAUTH_SECRET=replace_with_long_random_secret
 FRONTEND_URL=http://localhost:3000
+# Optional: Neon/Postgres. If not set, backend uses sqlite:///./crawler.db
+DATABASE_URL="postgresql://<user>:<password>@<hostname>.neon.tech:<port>/<dbname>?sslmode=require&channel_binding=require"
 
 # Google OAuth (for per-user Sheets onboarding)
 GOOGLE_OAUTH_CLIENT_ID=your_google_oauth_client_id
@@ -50,6 +54,8 @@ SHEET_DEFAULT=your_default_sheet_id
 GOOGLE_APPLICATION_CREDENTIALS=credentials.json
 ```
 
+Get your connection string from Neon Console -> Project -> Dashboard -> Connect.
+
 ### Generate Fernet key
 
 ```bash
@@ -64,7 +70,8 @@ PY
 From project root:
 
 ```bash
-source venv/bin/activate
+source backend/venv/bin/activate
+cd backend
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -192,8 +199,48 @@ docker compose -f backend/docker-compose.yml down
 ### Notes
 
 - Keep secrets in `backend/.env` (already excluded from build context).
-- `crawler.db` and `output/` are mounted so data persists across container restarts.
+- `output/` is mounted so generated files persist across container restarts.
 - `config/` is mounted read-only to keep default site config consistent.
+- For Neon mode, set `DATABASE_URL` in `backend/.env`.
+
+## 10) Migrate existing `crawler.db` to Neon
+
+Use one of the paths below once Neon `DATABASE_URL` is set in `backend/.env`.
+
+### Option A (recommended): `pgloader`
+
+```bash
+pgloader backend/crawler.db "$DATABASE_URL"
+```
+
+### Option B: Python migration script (includes row-count checks)
+
+```bash
+source backend/venv/bin/activate
+python backend/scripts/migrate_sqlite_to_postgres.py
+```
+
+The script:
+- creates missing tables in Neon using SQLAlchemy models
+- copies rows from SQLite to Neon in FK-safe order
+- prints source/target row counts for `users`, `run_logs`, `job_hashes`, `scraper_sites`
+
+## 11) Verify and rollback
+
+### Verify
+
+With `DATABASE_URL` set to Neon:
+- start backend and call `GET /health`
+- test auth flow (`POST /auth/login`)
+- test data routes (`GET /logs`, `GET /sites`)
+- trigger run route (`POST /run`)
+
+### Rollback
+
+To return to SQLite:
+- unset `DATABASE_URL` (or set `DATABASE_URL=sqlite:///./crawler.db`)
+- if using Docker and you want file persistence, re-add the `crawler.db` bind mount
+- restart backend
 
 ## 8) Make Google OAuth public (production)
 

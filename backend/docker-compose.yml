@@ -9,7 +9,6 @@ services:
     env_file:
       - .env
     volumes:
-      - ./crawler.db:/app/crawler.db
       - ./output:/app/output
       - ./config:/app/config:ro
     restart: unless-stopped
