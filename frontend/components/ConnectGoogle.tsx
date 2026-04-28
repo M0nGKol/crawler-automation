@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 
 import { apiFetch, getGoogleAuthUrl, getMe, getSheetsStatus, getStoredToken } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
@@ -36,6 +37,7 @@ async function ensureUserId(): Promise<string | null> {
 
 export default function ConnectGoogle() {
   const { t } = useLocale();
+  const pathname = usePathname();
   const [status, setStatus] = useState<ConnectionState>({ connected: false });
   const [loading, setLoading] = useState(false);
   const [testResult, setTestResult] = useState<string>("");
@@ -65,26 +67,15 @@ export default function ConnectGoogle() {
     void refreshStatus();
   }, [refreshStatus]);
 
-  useEffect(() => {
-    const listener = (event: MessageEvent) => {
-      if (!event?.data) return;
-      if (event.data.success) {
-        void refreshStatus();
-      }
-    };
-    window.addEventListener("message", listener);
-    return () => window.removeEventListener("message", listener);
-  }, [refreshStatus]);
-
   const connectGoogle = async () => {
     setLoading(true);
     setTestResult("");
     try {
       const userId = await ensureUserId();
       if (!userId) throw new Error("Missing user id");
-      const data = await getGoogleAuthUrl(userId);
+      const data = await getGoogleAuthUrl(userId, pathname || "/config");
       if (!data.auth_url) throw new Error("No auth URL returned");
-      window.open(data.auth_url, "google-oauth", "width=500,height=600");
+      window.location.href = data.auth_url;
     } finally {
       setLoading(false);
     }
