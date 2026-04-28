@@ -9,7 +9,6 @@ FastAPI + scraper backend for:
 
 - Python 3.11+ (recommended 3.11.x)
 - pip
-- Chromium for Playwright
 
 ## 1) Install dependencies
 
@@ -19,7 +18,6 @@ From project root:
 python3 -m venv backend/venv
 source backend/venv/bin/activate
 pip install -r backend/requirements.txt
-python -m playwright install chromium
 ```
 
 All `pip` installs should happen inside `backend/venv`.

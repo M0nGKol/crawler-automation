@@ -10,12 +10,15 @@ from domain.job import Job
 log = logging.getLogger(__name__)
 
 
-async def scrape_claude_fallback(page, site_name: str, config: dict[str, Any], claude: Any) -> list[Job]:
+async def scrape_claude_fallback(page_or_html, site_name: str, config: dict[str, Any], claude: Any) -> list[Job]:
     if not claude:
         log.warning("  No ANTHROPIC_API_KEY — skipping claude_fallback for %s", site_name)
         return []
 
-    html = await page.content()
+    if isinstance(page_or_html, str):
+        html = page_or_html
+    else:
+        html = await page_or_html.content()
     body = None
     for pattern in [
         r"<main[\s>].*?</main>",
