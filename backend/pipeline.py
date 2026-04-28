@@ -35,8 +35,13 @@ from services.masking import mask_jobs
 
 log = logging.getLogger(__name__)
 
-# Sites confirmed working — others default to inactive
-_ACTIVE_SITE_NAMES = {"indeed_japan", "osaka_university_hospital", "jobmedley"}
+BLOCKED_SITE_REPORTS: dict[str, dict[str, str]] = {
+    "indeed_japan": {
+        "status": "skipped",
+        "reason": "cloudflare_blocked",
+        "log_message": "indeed_japan skipped: Cloudflare protected, no viable free endpoint",
+    }
+}
 
 
 # ── TASK 6: Safe per-scraper wrapper ────────────────────────────────────────
@@ -71,7 +76,7 @@ def _seed_scraper_sites(sites_config: dict[str, Any]) -> None:
                     site_name=site_name,
                     url=cfg.get("url", ""),
                     is_default=True,
-                    is_active=site_name in _ACTIVE_SITE_NAMES,
+                    is_active=cfg.get("active", True),
                     last_status="unknown",
                 )
                 db.add(site)
@@ -189,31 +194,54 @@ async def run_pipeline(
     # Seed default sites into DB (Task 7)
     _seed_scraper_sites(default_sites)
 
-    # Filter to only active sites (from DB if available)
-    active_site_names: set[str] | None = None
+    # Filter to only active sites from config and DB, logging skips without
+    # treating them as scraper failures.
+    db_active_map: dict[str, bool] = {}
     db = SessionLocal()
     try:
-        active_rows = (
-            db.query(ScraperSite.site_name)
-            .filter(ScraperSite.is_active.is_(True))
-            .all()
-        )
-        if active_rows:
-            active_site_names = {r.site_name for r in active_rows}
+        rows = db.query(ScraperSite.site_name, ScraperSite.is_active).all()
+        db_active_map = {row.site_name: bool(row.is_active) for row in rows}
     except Exception:
         pass
     finally:
         db.close()
 
-    if active_site_names:
-        sites = {k: v for k, v in sites.items() if k in active_site_names}
+    active_sites: dict[str, Any] = {}
+    site_reports: dict[str, dict[str, str]] = {}
+    for site_name, cfg in sites.items():
+        blocked_report = BLOCKED_SITE_REPORTS.get(site_name)
+        if blocked_report:
+            log.info(blocked_report["log_message"])
+            site_reports[site_name] = {
+                "status": blocked_report["status"],
+                "reason": blocked_report["reason"],
+            }
+            _update_site_status(site_name, blocked_report["status"])
+            continue
+
+        if cfg.get("active", True) is False:
+            log.info("Skipping %s: marked inactive", site_name)
+            site_reports[site_name] = {"status": "skipped", "reason": "inactive"}
+            _update_site_status(site_name, "skipped")
+            continue
+
+        if site_name in db_active_map and db_active_map[site_name] is False:
+            log.info("Skipping %s: marked inactive", site_name)
+            site_reports[site_name] = {"status": "skipped", "reason": "inactive"}
+            _update_site_status(site_name, "skipped")
+            continue
+
+        active_sites[site_name] = cfg
+
+    sites = active_sites
 
     sites_attempted = len(sites)
     log.info(
-        "Running %d active sites (%d default + %d custom)",
+        "Running %d active sites (%d default + %d custom, %d skipped inactive)",
         sites_attempted,
         len(default_sites),
         len(user_sites),
+        len(site_reports),
     )
 
     # Scrape all sites with per-site isolation (Task 6)
@@ -230,9 +258,11 @@ async def run_pipeline(
         if site_jobs:
             _update_site_status(site_name, "success")
             sites_succeeded += 1
+            site_reports[site_name] = {"status": "success"}
         else:
             _update_site_status(site_name, "failed")
             sites_failed += 1
+            site_reports[site_name] = {"status": "failed"}
 
     if not jobs:
         return {
@@ -246,6 +276,7 @@ async def run_pipeline(
             "sites_attempted": sites_attempted,
             "sites_succeeded": sites_succeeded,
             "sites_failed": sites_failed,
+            "site_reports": site_reports,
         }
 
     # Dedup (in-run + cross-run via DB)
@@ -295,6 +326,7 @@ async def run_pipeline(
         "sites_attempted": sites_attempted,
         "sites_succeeded": sites_succeeded,
         "sites_failed": sites_failed,
+        "site_reports": site_reports,
     }
 
 

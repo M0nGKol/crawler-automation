@@ -49,6 +49,14 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 _oauth_states: dict[str, float] = {}
 
 
+def _normalize_return_to(return_to: str | None) -> str:
+    if not return_to:
+        return "/dashboard"
+    if not return_to.startswith("/") or return_to.startswith("//"):
+        return "/dashboard"
+    return return_to
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
@@ -213,7 +221,11 @@ def auth_register(payload: RegisterRequest, db: Session = Depends(get_db)) -> di
 
 
 @app.get("/auth/google")
-def auth_google(user_id: str = Query(...), db: Session = Depends(get_db)) -> dict[str, str]:
+def auth_google(
+    user_id: str = Query(...),
+    return_to: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -221,6 +233,7 @@ def auth_google(user_id: str = Query(...), db: Session = Depends(get_db)) -> dic
     state = secrets.token_urlsafe(32)
     _oauth_states[state] = time.time()
     _oauth_states[f"uid_{state}"] = user_id
+    _oauth_states[f"return_to_{state}"] = _normalize_return_to(return_to)
     return {"auth_url": get_google_auth_url(state)}
 
 
@@ -247,9 +260,11 @@ async def auth_google_callback(
         user_id = _oauth_states.get(f"uid_{state}")
         if not user_id:
             raise ValueError("Missing user for OAuth state")
+        return_to = _normalize_return_to(_oauth_states.get(f"return_to_{state}"))
 
         _oauth_states.pop(state, None)
         _oauth_states.pop(f"uid_{state}", None)
+        _oauth_states.pop(f"return_to_{state}", None)
 
         token = exchange_code_for_token(code)
         _ = get_user_info(token)
@@ -267,18 +282,21 @@ async def auth_google_callback(
         )
 
         jwt_token = create_jwt(user.id)
-        
+
         url = (
-            f"{FRONTEND_URL}/onboarding/callback?success=true"
+            f"{FRONTEND_URL}/auth/callback?success=true"
             f"&token={jwt_token}"
             f"&user_id={user.id}"
+            f"&return_to={urllib.parse.quote(return_to, safe='')}"
             f"&sheet_url={urllib.parse.quote(workspace['sheet_url'], safe='')}"
             f"&sheet_title={urllib.parse.quote(workspace['sheet_title'], safe='')}"
         )
         return RedirectResponse(url=url)
     except Exception as exc:
         error = urllib.parse.quote(str(exc), safe="")
-        return RedirectResponse(url=f"{FRONTEND_URL}/onboarding/callback?success=false&error={error}")
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/auth/callback?success=false&error={error}&return_to=%2Fonboarding"
+        )
 
 
 @app.post("/auth/login")
