@@ -43,6 +43,8 @@ BLOCKED_SITE_REPORTS: dict[str, dict[str, str]] = {
     }
 }
 
+AUTO_DISABLE_FAILURE_THRESHOLD = 5
+
 
 # ── TASK 6: Safe per-scraper wrapper ────────────────────────────────────────
 
@@ -88,8 +90,14 @@ def _seed_scraper_sites(sites_config: dict[str, Any]) -> None:
         db.close()
 
 
-def _update_site_status(site_name: str, status: str) -> None:
-    """Update last_status and last_run_at for a site in scraper_sites."""
+def _update_site_status(
+    site_name: str,
+    status: str,
+    *,
+    job_count: int = 0,
+    failure_delta: int | None = None,
+) -> None:
+    """Update health fields for a site in scraper_sites."""
     db = SessionLocal()
     try:
         site = (
@@ -99,6 +107,19 @@ def _update_site_status(site_name: str, status: str) -> None:
         )
         if site:
             site.last_status = status
+            site.last_job_count = job_count
+            if failure_delta is None:
+                if status == "success":
+                    site.consecutive_failures = 0
+                elif status in {"failed", "timeout"}:
+                    site.consecutive_failures += 1
+            else:
+                site.consecutive_failures = max(0, site.consecutive_failures + failure_delta)
+
+            if site.consecutive_failures >= AUTO_DISABLE_FAILURE_THRESHOLD:
+                site.is_active = False
+                log.warning("Auto-disabled %s: %d consecutive failures", site_name, site.consecutive_failures)
+
             site.last_run_at = datetime.now(timezone.utc)
             db.commit()
     except Exception as exc:
@@ -106,6 +127,21 @@ def _update_site_status(site_name: str, status: str) -> None:
         db.rollback()
     finally:
         db.close()
+
+
+def log_run_summary(results: list[dict[str, Any]]) -> None:
+    total = len(results)
+    succeeded = [r for r in results if r.get("jobs")]
+
+    log.info("═" * 50)
+    log.info("RUN COMPLETE: %d/%d sites succeeded", len(succeeded), total)
+    log.info("═" * 50)
+    for result in results:
+        jobs_count = len(result.get("jobs", []))
+        status = result.get("status", "ok")
+        icon = "✓" if jobs_count > 0 else "✗"
+        log.info("  %s %-35s %3d jobs  [%s]", icon, result["site"], jobs_count, status)
+    log.info("═" * 50)
 
 
 # ── TASK 5: Build JobRaw / JobMasked from masked Job objects ─────────────────
@@ -246,23 +282,34 @@ async def run_pipeline(
 
     # Scrape all sites with per-site isolation (Task 6)
     # The orchestrator already handles per-site errors; we track status here
-    jobs = await scrape_all(sites, settings.sites_filter, claude)
+    jobs, scrape_results = await scrape_all(sites, settings.sites_filter, claude)
+    log_run_summary(scrape_results)
 
-    # Update site statuses (best-effort: mark attempted as succeeded for now;
-    # the orchestrator already logs individual failures)
     sites_succeeded = 0
     sites_failed = 0
-    for site_name in sites:
-        # Heuristic: if any jobs came from this site, mark success
-        site_jobs = [j for j in jobs if getattr(j, "source", "") == site_name]
-        if site_jobs:
-            _update_site_status(site_name, "success")
+    for result in scrape_results:
+        site_name = str(result["site"])
+        result_status = str(result.get("status", "failed"))
+        job_count = int(result.get("job_count", len(result.get("jobs", []))))
+
+        if result_status == "success":
+            _update_site_status(site_name, "success", job_count=job_count)
             sites_succeeded += 1
-            site_reports[site_name] = {"status": "success"}
+            site_reports[site_name] = {
+                "status": "success",
+                "job_count": str(job_count),
+                "fetch_method": str(result.get("fetch_method", "")),
+            }
         else:
-            _update_site_status(site_name, "failed")
+            persisted_status = "timeout" if result_status == "timeout" else "failed"
+            _update_site_status(site_name, persisted_status, job_count=job_count)
             sites_failed += 1
-            site_reports[site_name] = {"status": "failed"}
+            site_reports[site_name] = {
+                "status": result_status,
+                "job_count": str(job_count),
+            }
+            if result.get("error"):
+                site_reports[site_name]["error"] = str(result["error"])
 
     if not jobs:
         return {

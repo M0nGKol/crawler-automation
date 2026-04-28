@@ -81,6 +81,8 @@ class ScraperSite(Base):
     is_default: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_status: Mapped[str] = mapped_column(String, default="unknown", nullable=False)
+    last_job_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
@@ -103,10 +105,15 @@ _RUN_LOG_MIGRATIONS = [
     "ALTER TABLE run_logs ADD COLUMN jobs_found INTEGER DEFAULT 0",
 ]
 
+_SCRAPER_SITE_MIGRATIONS = [
+    "ALTER TABLE scraper_sites ADD COLUMN last_job_count INTEGER DEFAULT 0",
+    "ALTER TABLE scraper_sites ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
+]
+
 
 def _run_migrations(conn) -> None:  # type: ignore[no-untyped-def]
     """Apply ALTER TABLE migrations that SQLite's create_all won't handle."""
-    for stmt in _RUN_LOG_MIGRATIONS:
+    for stmt in [*_RUN_LOG_MIGRATIONS, *_SCRAPER_SITE_MIGRATIONS]:
         try:
             conn.execute(text(stmt))
             conn.commit()
