@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime
 
@@ -9,12 +10,13 @@ from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship
 
 log = logging.getLogger(__name__)
 
-DATABASE_URL = "sqlite:///./crawler.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./crawler.db")
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False},
-)
+_engine_kwargs = {}
+if DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -115,5 +117,6 @@ def _run_migrations(conn) -> None:  # type: ignore[no-untyped-def]
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
-    with engine.connect() as conn:
-        _run_migrations(conn)
+    if DATABASE_URL.startswith("sqlite"):
+        with engine.connect() as conn:
+            _run_migrations(conn)

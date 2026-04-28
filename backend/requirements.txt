@@ -14,6 +14,7 @@ google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 cryptography==42.0.5
 sqlalchemy==2.0.30
+psycopg2-binary
 aiosqlite==0.20.0
 python-dateutil==2.9.0
 requests
