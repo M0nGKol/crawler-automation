@@ -14,25 +14,9 @@ import {
   getStatus,
   getStoredToken,
   startRun,
-  toggleSite,
 } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 import Sidebar from "@/components/Sidebar";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: status badge label
-// ─────────────────────────────────────────────────────────────────────────────
-function siteStatusLabel(status: string) {
-  if (status === "success") return "✅ Working";
-  if (status === "failed") return "⚠️ Broken";
-  return "— Unknown";
-}
-
-function siteStatusColor(status: string) {
-  if (status === "success") return "var(--color-success, #4ade80)";
-  if (status === "failed") return "var(--color-danger, #f87171)";
-  return "var(--color-text-muted)";
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Add-site modal
@@ -231,16 +215,6 @@ export default function DashboardPage() {
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     };
   }, []);
-
-  // ── Toggle site ───────────────────────────────────────────────────────────
-  const handleToggle = async (site: SiteRecord) => {
-    const token = getStoredToken();
-    if (!token) return;
-    try {
-      const updated = await toggleSite(token, site.id, !site.is_active);
-      setSites((prev) => prev.map((s) => (s.id === site.id ? updated : s)));
-    } catch { /* silent */ }
-  };
 
   // ── Add custom site ───────────────────────────────────────────────────────
   const handleAddSite = async (name: string, url: string) => {
@@ -454,7 +428,7 @@ export default function DashboardPage() {
           )}
         </div>
 
-        {/* ── Sites table (Task 10) ─────────────────────────────────────── */}
+        {/* ── Sites list ─────────────────────────────────────────────────── */}
         <div className="animate-fade-in-delay-2">
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px" }}>
             <h2 style={{ fontSize: "1rem", fontWeight: 700, color: "var(--color-text-primary)" }}>
@@ -471,100 +445,48 @@ export default function DashboardPage() {
             </button>
           </div>
 
-          <div className="glass-card-static" style={{ padding: 0, overflow: "hidden" }}>
+          <div className="glass-card-static" style={{ padding: "16px" }}>
             {sitesLoading ? (
-              <p style={{ padding: "24px", color: "var(--color-text-muted)", fontSize: "0.9rem" }}>Loading sites…</p>
+              <p style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>Loading sites…</p>
             ) : sites.length === 0 ? (
-              <p style={{ padding: "24px", color: "var(--color-text-muted)", fontSize: "0.9rem" }}>No sites found.</p>
+              <p style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>No sites found.</p>
             ) : (
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
-                  <thead>
-                    <tr style={{ borderBottom: "1px solid var(--color-border, rgba(255,255,255,0.08))" }}>
-                      {["Site Name", "URL", "Type", "Status", "Last Run", "Active"].map((h) => (
-                        <th
-                          key={h}
-                          style={{
-                            padding: "12px 16px", textAlign: "left",
-                            color: "var(--color-text-muted)", fontWeight: 600,
-                            fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.05em",
-                          }}
-                        >
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sites.map((site) => (
-                      <tr
-                        key={site.id}
-                        style={{ borderBottom: "1px solid var(--color-border, rgba(255,255,255,0.04))" }}
+              <div style={{ display: "grid", gap: "10px" }}>
+                {sites.map((site) => (
+                  <div
+                    key={site.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      padding: "12px",
+                      border: "1px solid var(--color-border, rgba(255,255,255,0.12))",
+                      borderRadius: "10px",
+                    }}
+                  >
+                    <div>
+                      <p style={{ fontWeight: 600, color: "var(--color-text-primary)" }}>{site.site_name}</p>
+                      <p style={{ fontSize: "0.85rem", color: "var(--color-text-muted)" }}>{site.url}</p>
+                      {site.status_note && (
+                        <p style={{ fontSize: "0.75rem", color: "var(--color-warning, #fbbf24)" }}>{site.status_note}</p>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span
+                        style={{
+                          fontSize: "0.75rem",
+                          padding: "4px 8px",
+                          borderRadius: "999px",
+                          background: site.is_active ? "rgba(22, 163, 74, 0.2)" : "rgba(107, 114, 128, 0.25)",
+                          color: site.is_active ? "#86efac" : "#9ca3af",
+                        }}
                       >
-                        <td style={{ padding: "12px 16px", color: "var(--color-text-primary)", fontWeight: 500 }}>
-                          {site.site_name}
-                        </td>
-                        <td style={{ padding: "12px 16px", color: "var(--color-text-muted)", maxWidth: "200px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          <a href={site.url} target="_blank" rel="noreferrer" style={{ color: "var(--color-text-muted)", textDecoration: "none" }}>
-                            {site.url}
-                          </a>
-                        </td>
-                        <td style={{ padding: "12px 16px" }}>
-                          <span style={{
-                            fontSize: "0.75rem", padding: "2px 8px", borderRadius: "100px",
-                            background: site.is_default ? "rgba(129,140,248,0.15)" : "rgba(232,121,160,0.15)",
-                            color: site.is_default ? "var(--color-primary, #818cf8)" : "var(--color-sakura, #e879a0)",
-                          }}>
-                            {site.is_default ? "Default" : "Custom"}
-                          </span>
-                        </td>
-                        <td style={{ padding: "12px 16px", color: siteStatusColor(site.last_status) }}>
-                          {siteStatusLabel(site.last_status)}
-                        </td>
-                        <td style={{ padding: "12px 16px", color: "var(--color-text-muted)", fontSize: "0.8rem" }}>
-                          {site.last_run_at
-                            ? new Date(site.last_run_at).toLocaleString("ja-JP", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-                            : "—"}
-                        </td>
-                        <td style={{ padding: "12px 16px" }}>
-                          {/* Toggle switch */}
-                          <label
-                            style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", gap: "8px" }}
-                            title={site.is_active ? "Disable site" : "Enable site"}
-                          >
-                            <input
-                              type="checkbox"
-                              id={`toggle-${site.id}`}
-                              checked={site.is_active}
-                              onChange={() => void handleToggle(site)}
-                              style={{ display: "none" }}
-                            />
-                            <span style={{
-                              display: "inline-block",
-                              width: "36px", height: "20px",
-                              borderRadius: "10px",
-                              background: site.is_active
-                                ? "var(--color-sakura, #e879a0)"
-                                : "var(--color-border, rgba(255,255,255,0.15))",
-                              position: "relative",
-                              transition: "background 0.2s",
-                            }}>
-                              <span style={{
-                                position: "absolute",
-                                top: "2px",
-                                left: site.is_active ? "18px" : "2px",
-                                width: "16px", height: "16px",
-                                borderRadius: "50%",
-                                background: "#fff",
-                                transition: "left 0.2s",
-                              }} />
-                            </span>
-                          </label>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        {site.is_active ? "✅ Active" : "⚠️ Inactive"}
+                      </span>
+                      <span style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>{site.type}</span>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>

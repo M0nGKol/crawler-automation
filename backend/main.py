@@ -24,6 +24,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Qu
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, HttpUrl
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -152,6 +153,40 @@ def _load_default_sites() -> dict[str, Any]:
     with open("config/sites.yaml", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
     return loaded.get("sites", {})
+
+
+def load_sites_from_yaml() -> list[dict[str, Any]]:
+    """Load default sites from YAML for /sites/list response."""
+    backend_dir = Path(__file__).resolve().parent
+    candidate_paths = [
+        backend_dir / "sites.yml",
+        backend_dir / "config" / "sites.yml",
+        backend_dir / "config" / "sites.yaml",
+    ]
+    yaml_path = next((path for path in candidate_paths if path.exists()), None)
+    if not yaml_path:
+        return []
+
+    with open(yaml_path, "r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+
+    sites = []
+    for site_name, config in (data.get("sites") or {}).items():
+        sites.append(
+            {
+                "id": site_name,
+                "site_name": site_name,
+                "url": config.get("url", ""),
+                "type": config.get("type", ""),
+                "mode": config.get("mode", ""),
+                "is_default": True,
+                "is_active": bool(config.get("active", False)),
+                "last_status": "unknown",
+                "status_note": config.get("status_note", ""),
+                "last_run_at": None,
+            }
+        )
+    return sites
 
 
 def _cleanup_oauth_states() -> None:
@@ -592,18 +627,45 @@ def list_sites(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Return all default sites + the current user's custom sites."""
+    """Return YAML default sites + active custom sites for current user."""
     user = _require_user_from_jwt(authorization, db)
-    rows = (
-        db.query(ScraperSite)
-        .filter(
-            (ScraperSite.is_default.is_(True))
-            | (ScraperSite.user_id == user.id)
-        )
-        .order_by(ScraperSite.is_default.desc(), ScraperSite.site_name)
-        .all()
-    )
-    return {"sites": [_format_site(r) for r in rows]}
+    default_sites = load_sites_from_yaml()
+    custom_sites: list[dict[str, Any]] = []
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, site_name, url, is_default, is_active, last_status, last_run_at
+                FROM scraper_sites
+                WHERE user_id = :user_id AND is_default = 0 AND is_active = 1
+                ORDER BY site_name
+                """
+            ),
+            {"user_id": user.id},
+        ).mappings().all()
+        custom_sites = [
+            {
+                "id": row.get("id"),
+                "site_name": row.get("site_name", ""),
+                "url": row.get("url", ""),
+                "type": "custom",
+                "mode": "custom",
+                "is_default": bool(row.get("is_default", False)),
+                "is_active": bool(row.get("is_active", True)),
+                "last_status": row.get("last_status", "unknown"),
+                "status_note": "",
+                "last_run_at": (
+                    row.get("last_run_at").isoformat()
+                    if row.get("last_run_at")
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+    except Exception:
+        custom_sites = []
+
+    return {"sites": default_sites + custom_sites}
 
 
 @app.put("/sites/{site_id}/toggle")
@@ -652,9 +714,12 @@ def _format_site(site: ScraperSite) -> dict[str, Any]:
         "id": site.id,
         "site_name": site.site_name,
         "url": site.url,
+        "type": "custom" if not site.is_default else "default",
+        "mode": "db",
         "is_default": site.is_default,
         "is_active": site.is_active,
         "last_status": site.last_status,
+        "status_note": "",
         "last_job_count": getattr(site, "last_job_count", 0),
         "consecutive_failures": getattr(site, "consecutive_failures", 0),
         "last_run_at": site.last_run_at.isoformat() if site.last_run_at else None,

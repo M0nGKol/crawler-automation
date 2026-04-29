@@ -133,9 +133,12 @@ export type SiteRecord = {
   id: string;
   site_name: string;
   url: string;
+  type: string;
+  mode: string;
   is_default: boolean;
   is_active: boolean;
   last_status: string;
+  status_note: string;
   last_run_at: string | null;
 };
 
