@@ -14,28 +14,33 @@ sites:
   # ── Tier 2: Claude fallback sites ────────────────────────────────────────
   # Switched to claude_fallback due to updated URLs requiring flexible scraping
   jobmedley:
+    active: true
     url: "https://job-medley.com/ans/"
     api_endpoint: "https://job-medley.com/api/v1/jobs?occupation=ans"
     type: job_board
     mode: claude_fallback
 
   mynavi:
+    active: false
     url: "https://kango.mynavi.jp/"
     type: job_board
     mode: claude_fallback
 
   nurse_senka:
+    active: false
     url: "https://www.nursejinzaibank.com/"
     type: job_board
     mode: claude_fallback
 
   kangowork:
+    active: false
     url: "https://kango-oshigoto.jp/"
     type: job_board
     mode: claude_fallback
 
   # Job Medley — Japan's largest healthcare job board (nurse listings in Tokyo)
   jobmedley_nurse_tokyo:
+    active: true
     url: "https://job-medley.com/ans/pref13/"
     api_endpoint: "https://job-medley.com/api/v1/jobs?occupation=ans&prefecture=13"
     type: job_board
@@ -43,6 +48,7 @@ sites:
 
   # Job Medley — Doctor listings in Tokyo
   jobmedley_doctor_tokyo:
+    active: true
     url: "https://job-medley.com/dr/pref13/"
     api_endpoint: "https://job-medley.com/api/v1/jobs?occupation=dr&prefecture=13"
     type: job_board
@@ -50,32 +56,38 @@ sites:
 
   # Job Medley — Pharmacist listings in Tokyo
   jobmedley_pharmacist_tokyo:
+    active: true
     url: "https://job-medley.com/apo/pref13/"
     api_endpoint: "https://job-medley.com/api/v1/jobs?occupation=apo&prefecture=13"
     type: job_board
     mode: claude_fallback
 
   tokyo_university_hospital:
+    active: false
     url: "https://www.h.u-tokyo.ac.jp/recruitment/"
     type: hospital_site
     mode: claude_fallback
 
   keio_university_hospital:
+    active: false
     url: "https://www.hosp.keio.ac.jp/iryo/saiyo/"
     type: hospital_site
     mode: claude_fallback
 
   osaka_university_hospital:
+    active: true
     url: "https://www.hosp.med.osaka-u.ac.jp/recruit/"
     type: hospital_site
     mode: claude_fallback
 
   national_cancer_center:
+    active: false
     url: "https://www.ncc.go.jp/jp/recruit/index.html"
     type: hospital_site
     mode: claude_fallback
 
   tokyo_medical_university:
+    active: false
     url: "https://hospinfo.tokyo-med.ac.jp/recruit/"
     type: hospital_site
     mode: claude_fallback
