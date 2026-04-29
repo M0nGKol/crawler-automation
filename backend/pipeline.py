@@ -32,6 +32,7 @@ from scraping.orchestrator import scrape_all
 from services.deadline_filter import is_within_deadline
 from services.deduplication import deduplicate_jobs
 from services.masking import mask_jobs
+from scrapers.indeed_japan import run as scrape_indeed
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,14 @@ BLOCKED_SITE_REPORTS: dict[str, dict[str, str]] = {
 }
 
 AUTO_DISABLE_FAILURE_THRESHOLD = 5
+
+# In the existing codebase, most sites are scraped via `scraping.orchestrator.scrape_all`.
+# `indeed_japan` is handled by this dedicated entrypoint because it needs a custom
+# ScraperAPI + RSS fallback flow.
+scrapers = [
+    ("indeed_japan", scrape_indeed),
+    # ... other scrapers
+]
 
 
 # ── TASK 6: Safe per-scraper wrapper ────────────────────────────────────────
@@ -72,13 +81,20 @@ def _seed_scraper_sites(sites_config: dict[str, Any]) -> None:
                 .filter(ScraperSite.site_name == site_name)
                 .first()
             )
-            if not existing:
+            desired_active = bool(cfg.get("active", True))
+            if existing:
+                # Keep DB activation state aligned with `config/sites.yaml`.
+                # Without this, enabling/disabling a default site in YAML may not take effect
+                # if the DB row was seeded earlier.
+                if bool(getattr(existing, "is_default", True)):
+                    existing.is_active = desired_active
+            else:
                 site = ScraperSite(
                     id=uuid.uuid4().hex,
                     site_name=site_name,
                     url=cfg.get("url", ""),
                     is_default=True,
-                    is_active=cfg.get("active", True),
+                    is_active=desired_active,
                     last_status="unknown",
                 )
                 db.add(site)
@@ -246,7 +262,7 @@ async def run_pipeline(
     site_reports: dict[str, dict[str, str]] = {}
     for site_name, cfg in sites.items():
         blocked_report = BLOCKED_SITE_REPORTS.get(site_name)
-        if blocked_report:
+        if blocked_report and cfg.get("mode") != "scraperapi_with_rss_fallback":
             log.info(blocked_report["log_message"])
             site_reports[site_name] = {
                 "status": blocked_report["status"],
@@ -282,7 +298,74 @@ async def run_pipeline(
 
     # Scrape all sites with per-site isolation (Task 6)
     # The orchestrator already handles per-site errors; we track status here
-    jobs, scrape_results = await scrape_all(sites, settings.sites_filter, claude)
+    filter_list = None if settings.sites_filter.strip().lower() == "all" else [s.strip() for s in settings.sites_filter.split(",")]
+
+    indeed_sites = {
+        name: cfg
+        for name, cfg in sites.items()
+        if name == "indeed_japan" and cfg.get("mode") == "scraperapi_with_rss_fallback"
+    }
+    other_sites = {name: cfg for name, cfg in sites.items() if name not in indeed_sites}
+
+    jobs: list = []
+    scrape_results: list[dict[str, Any]] = []
+
+    if other_sites:
+        jobs_other, scrape_results_other = await scrape_all(other_sites, settings.sites_filter, claude)
+        jobs.extend(jobs_other)
+        scrape_results.extend(scrape_results_other)
+
+    # Dedicated Indeed Japan flow (RSS first, ScraperAPI fallback).
+    if indeed_sites:
+        MAX_RETRIES = 3
+        RETRY_BACKOFF_SECONDS = 5
+
+        for site_name, cfg in indeed_sites.items():
+            if filter_list and site_name not in filter_list:
+                continue
+
+            last_error = ""
+            started_at = time.monotonic()
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    fetched_jobs = await safe_scrape(scrapers[0][1](), site_name)
+                    if fetched_jobs:
+                        scrape_results.append(
+                            {
+                                "site": site_name,
+                                "status": "success",
+                                "jobs": fetched_jobs,
+                                "job_count": len(fetched_jobs),
+                                "attempts": attempt,
+                                "duration_ms": int((time.monotonic() - started_at) * 1000),
+                                "fetch_method": str(cfg.get("mode", "")),
+                            }
+                        )
+                        jobs.extend(fetched_jobs)
+                        break
+
+                    last_error = "no jobs found"
+                except Exception as exc:
+                    last_error = str(exc)
+
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+            else:
+                final_status = "timeout" if last_error == "timeout" else "failed"
+                scrape_results.append(
+                    {
+                        "site": site_name,
+                        "status": final_status,
+                        "jobs": [],
+                        "job_count": 0,
+                        "attempts": MAX_RETRIES,
+                        "duration_ms": int((time.monotonic() - started_at) * 1000),
+                        "error": last_error,
+                        "fetch_method": str(cfg.get("mode", "")),
+                    }
+                )
+
     log_run_summary(scrape_results)
 
     sites_succeeded = 0
