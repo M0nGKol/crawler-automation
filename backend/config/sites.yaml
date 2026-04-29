@@ -5,11 +5,11 @@ sites:
   # To re-enable: add a residential proxy service (e.g. Oxylabs, Smartproxy)
   # and set mode: proxy_fetch with credentials in .env
   indeed_japan:
-    active: false
-    status_note: "blocked by Cloudflare on all endpoints including RSS — requires residential proxy or browser session, not viable on Render free tier"
-    url: "https://jp.indeed.com/jobs?q=%E7%9C%8B%E8%AD%B7%E5%B8%AB&l=%E6%9D%B1%E4%BA%AC&limit=20"
+    active: true
+    status_note: "Uses RSS first, falls back to ScraperAPI if blocked"
+    url: "https://jp.indeed.com/jobs?q=看護師&l=東京&limit=50"
     type: job_board
-    mode: claude_fallback
+    mode: scraperapi_with_rss_fallback
 
   # ── Tier 2: Claude fallback sites ────────────────────────────────────────
   # Switched to claude_fallback due to updated URLs requiring flexible scraping

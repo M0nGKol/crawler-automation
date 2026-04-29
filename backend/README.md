@@ -44,6 +44,7 @@ TOKEN_ENCRYPTION_KEY=your_fernet_key
 
 # Scraper
 ANTHROPIC_API_KEY=
+SCRAPERAPI_KEY=your_key_from_scraperapi.com
 SITES=all
 MASKING_LIMIT=30
 
