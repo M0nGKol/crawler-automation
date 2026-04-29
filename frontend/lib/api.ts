@@ -134,12 +134,10 @@ export type SiteRecord = {
   site_name: string;
   url: string;
   type: string;
-  mode: string;
   is_default: boolean;
   is_active: boolean;
-  last_status: string;
-  status_note: string;
-  last_run_at: string | null;
+  mode?: string;
+  last_run_at?: string | null;
 };
 
 export type RunStatus = {
@@ -164,7 +162,7 @@ export async function getSitesList(token: string): Promise<{ sites: SiteRecord[]
 }
 
 export async function toggleSite(token: string, siteId: string, isActive: boolean) {
-  const res = await apiFetch(`/sites/${siteId}/toggle`, {
+  const res = await apiFetch(`/sites/${siteId}`, {
     method: "PUT",
     headers: { ...authHeader(token) },
     body: JSON.stringify({ is_active: isActive }),

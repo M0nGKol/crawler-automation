@@ -17,6 +17,7 @@ import {
 } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 import Sidebar from "@/components/Sidebar";
+import { SitesList } from "@/components/SitesList";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Add-site modal
@@ -451,43 +452,7 @@ export default function DashboardPage() {
             ) : sites.length === 0 ? (
               <p style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>No sites found.</p>
             ) : (
-              <div style={{ display: "grid", gap: "10px" }}>
-                {sites.map((site) => (
-                  <div
-                    key={site.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      padding: "12px",
-                      border: "1px solid var(--color-border, rgba(255,255,255,0.12))",
-                      borderRadius: "10px",
-                    }}
-                  >
-                    <div>
-                      <p style={{ fontWeight: 600, color: "var(--color-text-primary)" }}>{site.site_name}</p>
-                      <p style={{ fontSize: "0.85rem", color: "var(--color-text-muted)" }}>{site.url}</p>
-                      {site.status_note && (
-                        <p style={{ fontSize: "0.75rem", color: "var(--color-warning, #fbbf24)" }}>{site.status_note}</p>
-                      )}
-                    </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      <span
-                        style={{
-                          fontSize: "0.75rem",
-                          padding: "4px 8px",
-                          borderRadius: "999px",
-                          background: site.is_active ? "rgba(22, 163, 74, 0.2)" : "rgba(107, 114, 128, 0.25)",
-                          color: site.is_active ? "#86efac" : "#9ca3af",
-                        }}
-                      >
-                        {site.is_active ? "✅ Active" : "⚠️ Inactive"}
-                      </span>
-                      <span style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>{site.type}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <SitesList sites={sites} />
             )}
           </div>
         </div>
