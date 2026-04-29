@@ -19,10 +19,12 @@ export function SitesList({ sites: initialSites }: { sites: Site[] }) {
   const toggleSite = async (siteId: string, currentActive: boolean) => {
     setLoading(siteId);
     try {
-      await apiFetch(`/sites/${siteId}`, {
+      const res = await apiFetch(`/sites/${siteId}`, {
         method: "PUT",
         body: JSON.stringify({ is_active: !currentActive }),
       });
+
+      if (!res.ok) throw new Error("Toggle failed");
 
       setSites((prev) =>
         prev.map((s) => (s.id === siteId ? { ...s, is_active: !currentActive } : s))

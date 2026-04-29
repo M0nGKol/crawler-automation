@@ -1,8 +1,8 @@
 """
 Google Sheets output sink.
 
-Writes raw job data to the 'raw_data' tab and masked data to the
-'masked_data' tab. Both tabs share the same 13-column schema so
+Writes raw job data to the 'Jobs Raw' tab and masked data to the
+'Jobs Masked' tab. Both tabs share the same 13-column schema so
 rows can be cross-referenced by the shared job id.
 """
 from __future__ import annotations
@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     import gspread
 
 log = logging.getLogger(__name__)
+
+RAW_TAB_NAME = "Jobs Raw"
+MASKED_TAB_NAME = "Jobs Masked"
+LOG_TAB_NAME = "Run Log"
 
 
 def _get_or_create_tab(
@@ -68,7 +72,7 @@ def write_to_sheets(
     user_id: str | None = None,
 ) -> str | None:
     """
-    Write jobs_raw → 'raw_data' tab and jobs_masked → 'masked_data' tab.
+    Write jobs_raw → 'Jobs Raw' tab and jobs_masked → 'Jobs Masked' tab.
 
     Returns the spreadsheet URL or None on failure.
     """
@@ -118,29 +122,29 @@ def write_to_sheets(
 
         ss = gc.open_by_key(effective_sheet_id)
 
-        # ── raw_data tab ──────────────────────────────────────────────────
-        ws_raw = _get_or_create_tab(ss, "raw_data", JOB_HEADERS)
+        # ── Jobs Raw tab ─────────────────────────────────────────────────
+        ws_raw = _get_or_create_tab(ss, RAW_TAB_NAME, JOB_HEADERS)
         existing_raw_ids = _get_existing_ids(ws_raw)
         new_raw_rows = [
             j.to_row() for j in jobs_raw if j.id not in existing_raw_ids
         ]
         if new_raw_rows:
             ws_raw.append_rows(new_raw_rows, value_input_option="USER_ENTERED")
-            log.info("━━ raw_data tab: appended %d new rows", len(new_raw_rows))
+            log.info("━━ Jobs Raw tab: appended %d new rows", len(new_raw_rows))
         else:
-            log.info("━━ raw_data tab: no new rows to append (all duplicates)")
+            log.info("━━ Jobs Raw tab: no new rows to append (all duplicates)")
 
-        # ── masked_data tab ───────────────────────────────────────────────
-        ws_masked = _get_or_create_tab(ss, "masked_data", JOB_HEADERS)
+        # ── Jobs Masked tab ───────────────────────────────────────────────
+        ws_masked = _get_or_create_tab(ss, MASKED_TAB_NAME, JOB_HEADERS)
         existing_masked_ids = _get_existing_ids(ws_masked)
         new_masked_rows = [
             j.to_row() for j in jobs_masked if j.id not in existing_masked_ids
         ]
         if new_masked_rows:
             ws_masked.append_rows(new_masked_rows, value_input_option="USER_ENTERED")
-            log.info("━━ masked_data tab: appended %d new rows", len(new_masked_rows))
+            log.info("━━ Jobs Masked tab: appended %d new rows", len(new_masked_rows))
         else:
-            log.info("━━ masked_data tab: no new rows to append (all duplicates)")
+            log.info("━━ Jobs Masked tab: no new rows to append (all duplicates)")
 
         sheet_url = f"https://docs.google.com/spreadsheets/d/{effective_sheet_id}"
         log.info(f"[SHEETS] Successfully wrote {len(new_raw_rows)} raw rows and {len(new_masked_rows)} masked rows")

@@ -150,7 +150,17 @@ def _default_site_name_from_url(url: str) -> str:
 
 
 def _load_default_sites() -> dict[str, Any]:
-    with open("config/sites.yaml", encoding="utf-8") as file:
+    backend_dir = Path(__file__).resolve().parent
+    candidate_paths = [
+        backend_dir / "sites.yml",
+        backend_dir / "config" / "sites.yml",
+        backend_dir / "config" / "sites.yaml",
+    ]
+    yaml_path = next((path for path in candidate_paths if path.exists()), None)
+    if not yaml_path:
+        return {}
+
+    with open(yaml_path, "r", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
     return loaded.get("sites", {})
 

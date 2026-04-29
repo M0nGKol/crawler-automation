@@ -243,6 +243,32 @@ async def run_pipeline(
 
     sites = merge_sites(default_sites, user_sites)
 
+    # If a user has toggled *default* sites in the UI, respect that here too.
+    # Otherwise the UI would change but the pipeline would still scrape based on
+    # `scraper_sites.is_active`.
+    if user_id:
+        db_prefs = SessionLocal()
+        try:
+            prefs_rows = db_prefs.execute(
+                text(
+                    """
+                    SELECT site_id, is_active
+                    FROM user_site_prefs
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": user_id},
+            ).mappings().all()
+            pref_map = {str(r["site_id"]): bool(r["is_active"]) for r in prefs_rows}
+            for site_name in default_sites.keys():
+                if site_name in pref_map:
+                    sites[site_name]["active"] = pref_map[site_name]
+        except Exception:
+            # Table may not exist yet; default YAML `active` will be used.
+            pass
+        finally:
+            db_prefs.close()
+
     # Seed default sites into DB (Task 7)
     _seed_scraper_sites(default_sites)
 
