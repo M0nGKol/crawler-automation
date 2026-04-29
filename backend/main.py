@@ -178,12 +178,8 @@ def load_sites_from_yaml() -> list[dict[str, Any]]:
                 "site_name": site_name,
                 "url": config.get("url", ""),
                 "type": config.get("type", ""),
-                "mode": config.get("mode", ""),
                 "is_default": True,
                 "is_active": bool(config.get("active", False)),
-                "last_status": "unknown",
-                "status_note": config.get("status_note", ""),
-                "last_run_at": None,
             }
         )
     return sites
@@ -541,18 +537,71 @@ def create_sites(
 
 
 @app.put("/sites/{site_id}")
-def update_site(
+def toggle_site(
     site_id: str,
     payload: dict[str, Any],
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    user = _require_user_from_jwt(authorization, db)
-    sites = parse_sites_yaml(user.sites_config)
-    sites[site_id] = payload
-    user.sites_config = yaml.safe_dump({"sites": sites}, allow_unicode=True)
+    current_user = _require_user_from_jwt(authorization, db)
+    is_active = bool(payload.get("is_active", True))
+
+    # Default sites use YAML keys as `id` (not the DB row id), so detect defaults
+    # by checking the YAML site map.
+    default_site_names = set(_load_default_sites().keys())
+    if site_id in default_site_names:
+        # Persist user preference for default sites.
+        try:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO user_site_prefs (user_id, site_id, is_active)
+                    VALUES (:user_id, :site_id, :is_active)
+                    ON CONFLICT(user_id, site_id) DO UPDATE SET is_active = :is_active
+                    """
+                ),
+                {"user_id": current_user.id, "site_id": site_id, "is_active": is_active},
+            )
+            db.commit()
+        except Exception:
+            # Table might not exist yet.
+            db.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_site_prefs (
+                        user_id TEXT,
+                        site_id TEXT,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        PRIMARY KEY (user_id, site_id)
+                    )
+                    """
+                )
+            )
+            db.commit()
+            db.execute(
+                text(
+                    """
+                    INSERT INTO user_site_prefs (user_id, site_id, is_active)
+                    VALUES (:user_id, :site_id, :is_active)
+                    ON CONFLICT(user_id, site_id) DO UPDATE SET is_active = :is_active
+                    """
+                ),
+                {"user_id": current_user.id, "site_id": site_id, "is_active": is_active},
+            )
+            db.commit()
+
+        return {"success": True, "site_id": site_id, "is_active": is_active}
+
+    # Custom site: update the scraper_sites row by DB id.
+    site = db.query(ScraperSite).filter(ScraperSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    if site.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorised")
+
+    site.is_active = is_active
     db.commit()
-    return {"message": "Site updated"}
+    return {"success": True, "site_id": site_id, "is_active": is_active}
 
 
 @app.post("/sites/add-url")
@@ -630,14 +679,33 @@ def list_sites(
     """Return YAML default sites + active custom sites for current user."""
     user = _require_user_from_jwt(authorization, db)
     default_sites = load_sites_from_yaml()
+
+    # Apply per-user activation preferences for default sites.
+    pref_map: dict[str, bool] = {}
+    try:
+        prefs = db.execute(
+            text(
+                """
+                SELECT site_id, is_active
+                FROM user_site_prefs
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user.id},
+        ).mappings().all()
+        pref_map = {str(r["site_id"]): bool(r["is_active"]) for r in prefs}
+    except Exception:
+        pref_map = {}
+
     custom_sites: list[dict[str, Any]] = []
     try:
+        # Return all custom sites (active + inactive) so the UI can toggle them.
         rows = db.execute(
             text(
                 """
-                SELECT id, site_name, url, is_default, is_active, last_status, last_run_at
+                SELECT id, site_name, url, is_default, is_active
                 FROM scraper_sites
-                WHERE user_id = :user_id AND is_default = 0 AND is_active = 1
+                WHERE user_id = :user_id AND is_default = 0
                 ORDER BY site_name
                 """
             ),
@@ -649,21 +717,17 @@ def list_sites(
                 "site_name": row.get("site_name", ""),
                 "url": row.get("url", ""),
                 "type": "custom",
-                "mode": "custom",
                 "is_default": bool(row.get("is_default", False)),
                 "is_active": bool(row.get("is_active", True)),
-                "last_status": row.get("last_status", "unknown"),
-                "status_note": "",
-                "last_run_at": (
-                    row.get("last_run_at").isoformat()
-                    if row.get("last_run_at")
-                    else None
-                ),
             }
             for row in rows
         ]
     except Exception:
         custom_sites = []
+
+    for site in default_sites:
+        if str(site["id"]) in pref_map:
+            site["is_active"] = bool(pref_map[str(site["id"])])
 
     return {"sites": default_sites + custom_sites}
 
