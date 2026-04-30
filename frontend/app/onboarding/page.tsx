@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { getGoogleAuthUrl, register } from "@/lib/api";
+import { register, setStoredToken } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 import LanguageToggle from "@/components/LanguageToggle";
 
@@ -21,6 +21,10 @@ export default function OnboardingPage() {
   const [sheetUrl, setSheetUrl] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const apiUrl =
+    process.env.NEXT_PUBLIC_API_URL ??
+    process.env.NEXT_PUBLIC_BACKEND_URL ??
+    "https://crawler-automation-1.onrender.com";
 
   const progressKeys = useMemo(
     () => [
@@ -38,6 +42,22 @@ export default function OnboardingPage() {
   );
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("token");
+    const googleConnected = params.get("google_connected");
+    const stepParam = Number(params.get("step") || "1");
+    const initialStep = Number.isFinite(stepParam) && stepParam >= 1 && stepParam <= 4 ? stepParam : 1;
+    setStep(initialStep);
+
+    if (token) {
+      setStoredToken(token);
+    }
+
+    if (googleConnected === "true") {
+      router.replace("/onboarding?step=3");
+      return;
+    }
+
     const handler = (event: MessageEvent) => {
       if (!event.data) return;
       if (event.data.success) {
@@ -49,7 +69,7 @@ export default function OnboardingPage() {
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, []);
+  }, [router]);
 
   useEffect(() => {
     if (step !== 3) return;
@@ -101,8 +121,14 @@ export default function OnboardingPage() {
     setError("");
     setLoading(true);
     try {
-      const data = await getGoogleAuthUrl(userId, "/onboarding");
-      window.location.href = data.auth_url;
+      if (!userId) {
+        throw new Error("Missing user id");
+      }
+      const query = new URLSearchParams({
+        user_id: userId,
+        return_to: "/onboarding?step=3",
+      });
+      window.location.href = `${apiUrl}/auth/google?${query.toString()}`;
     } catch (err) {
       setError(err instanceof Error ? err.message : t("onboarding.error.google"));
     } finally {
