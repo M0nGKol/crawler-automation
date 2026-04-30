@@ -270,9 +270,9 @@ def auth_register(payload: RegisterRequest, db: Session = Depends(get_db)) -> di
 @app.get("/auth/google")
 def auth_google(
     user_id: str = Query(...),
-    return_to: str | None = Query(default=None),
+    return_to: str = Query(default="/dashboard"),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
+) -> RedirectResponse:
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -281,7 +281,8 @@ def auth_google(
     _oauth_states[state] = time.time()
     _oauth_states[f"uid_{state}"] = user_id
     _oauth_states[f"return_to_{state}"] = _normalize_return_to(return_to)
-    return {"auth_url": get_google_auth_url(state)}
+    auth_url = get_google_auth_url(state)
+    return RedirectResponse(url=auth_url)
 
 
 @app.get("/auth/google/config")
