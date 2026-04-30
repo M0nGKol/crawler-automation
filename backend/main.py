@@ -48,7 +48,7 @@ from onboarding import setup_new_user_workspace
 from pipeline import run_pipeline
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
-_oauth_states: dict[str, float] = {}
+_oauth_states: dict[str, float | str] = {}
 log = logging.getLogger(__name__)
 
 
@@ -203,9 +203,12 @@ def _cleanup_oauth_states() -> None:
     for key in list(_oauth_states.keys()):
         if key.startswith("uid_"):
             continue
+        if key.startswith("return_to_"):
+            continue
         if now - _oauth_states[key] > 600:
             _oauth_states.pop(key, None)
             _oauth_states.pop(f"uid_{key}", None)
+            _oauth_states.pop(f"return_to_{key}", None)
 
 
 def _require_user_from_jwt(authorization: str | None, db: Session) -> User:
@@ -327,11 +330,12 @@ async def auth_google_callback(
 
         jwt_token = create_jwt(user.id)
 
+        separator = "&" if "?" in return_to else "?"
         url = (
-            f"{FRONTEND_URL}/auth/callback?success=true"
-            f"&token={jwt_token}"
+            f"{FRONTEND_URL}{return_to}{separator}"
+            f"token={urllib.parse.quote(jwt_token, safe='')}"
+            f"&google_connected=true"
             f"&user_id={user.id}"
-            f"&return_to={urllib.parse.quote(return_to, safe='')}"
             f"&sheet_url={urllib.parse.quote(workspace['sheet_url'], safe='')}"
             f"&sheet_title={urllib.parse.quote(workspace['sheet_title'], safe='')}"
         )
@@ -339,7 +343,7 @@ async def auth_google_callback(
     except Exception as exc:
         error = urllib.parse.quote(str(exc), safe="")
         return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/callback?success=false&error={error}&return_to=%2Fonboarding"
+            url=f"{FRONTEND_URL}/onboarding?error={error}"
         )
 
 

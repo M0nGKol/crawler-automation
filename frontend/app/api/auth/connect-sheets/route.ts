@@ -15,15 +15,10 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const response = await fetch(
-    `${apiUrl}/auth/google?user_id=${encodeURIComponent(userId)}`,
-    { cache: "no-store" },
-  );
-
-  if (!response.ok) {
-    return NextResponse.json({ error: "Failed to get OAuth URL" }, { status: 502 });
-  }
-
-  const data = await response.json();
-  return NextResponse.json({ auth_url: data.auth_url as string });
+  const returnTo = request.nextUrl.searchParams.get("return_to") || "/onboarding?step=3";
+  const query = new URLSearchParams({
+    user_id: userId,
+    return_to: returnTo,
+  });
+  return NextResponse.json({ auth_url: `${apiUrl}/auth/google?${query.toString()}` });
 }

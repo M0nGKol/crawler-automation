@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 
-import { apiFetch, getGoogleAuthUrl, getMe, getSheetsStatus, getStoredToken } from "@/lib/api";
+import { apiFetch, getMe, getSheetsStatus, getStoredToken } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 
 type ConnectionState = {
@@ -41,6 +41,10 @@ export default function ConnectGoogle() {
   const [status, setStatus] = useState<ConnectionState>({ connected: false });
   const [loading, setLoading] = useState(false);
   const [testResult, setTestResult] = useState<string>("");
+  const apiUrl =
+    process.env.NEXT_PUBLIC_API_URL ??
+    process.env.NEXT_PUBLIC_BACKEND_URL ??
+    "https://crawler-automation-1.onrender.com";
 
   const refreshStatus = useCallback(async () => {
     const token = getStoredToken();
@@ -73,9 +77,11 @@ export default function ConnectGoogle() {
     try {
       const userId = await ensureUserId();
       if (!userId) throw new Error("Missing user id");
-      const data = await getGoogleAuthUrl(userId, pathname || "/config");
-      if (!data.auth_url) throw new Error("No auth URL returned");
-      window.location.href = data.auth_url;
+      const query = new URLSearchParams({
+        user_id: userId,
+        return_to: pathname || "/config",
+      });
+      window.location.href = `${apiUrl}/auth/google?${query.toString()}`;
     } finally {
       setLoading(false);
     }

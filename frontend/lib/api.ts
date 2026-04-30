@@ -86,11 +86,7 @@ export async function getMe(token: string) {
 export async function getGoogleAuthUrl(userId: string, returnTo?: string) {
   const query = new URLSearchParams({ user_id: userId });
   if (returnTo) query.set("return_to", returnTo);
-  const res = await apiFetch(`/auth/google?${query.toString()}`, {
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error("Failed to fetch Google OAuth URL");
-  return (await res.json()) as { auth_url: string };
+  return { auth_url: `${API_URL}/auth/google?${query.toString()}` };
 }
 
 export async function getSheetsStatus(token: string) {
