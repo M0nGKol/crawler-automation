@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -48,6 +49,7 @@ from pipeline import run_pipeline
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 _oauth_states: dict[str, float] = {}
+log = logging.getLogger(__name__)
 
 
 def _normalize_return_to(return_to: str | None) -> str:
@@ -555,6 +557,7 @@ def toggle_site(
 ) -> dict[str, str]:
     current_user = _require_user_from_jwt(authorization, db)
     is_active = bool(payload.get("is_active", True))
+    log.info("[TOGGLE] site_id=%s is_active=%s user=%s", site_id, is_active, current_user.id)
 
     # Default sites use YAML keys as `id` (not the DB row id), so detect defaults
     # by checking the YAML site map.
@@ -567,7 +570,8 @@ def toggle_site(
                     """
                     INSERT INTO user_site_prefs (user_id, site_id, is_active)
                     VALUES (:user_id, :site_id, :is_active)
-                    ON CONFLICT(user_id, site_id) DO UPDATE SET is_active = :is_active
+                    ON CONFLICT (user_id, site_id) DO UPDATE SET
+                        is_active = EXCLUDED.is_active
                     """
                 ),
                 {"user_id": current_user.id, "site_id": site_id, "is_active": is_active},
@@ -579,9 +583,10 @@ def toggle_site(
                 text(
                     """
                     CREATE TABLE IF NOT EXISTS user_site_prefs (
-                        user_id TEXT,
-                        site_id TEXT,
+                        user_id TEXT NOT NULL,
+                        site_id TEXT NOT NULL,
                         is_active BOOLEAN DEFAULT TRUE,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (user_id, site_id)
                     )
                     """
@@ -593,7 +598,8 @@ def toggle_site(
                     """
                     INSERT INTO user_site_prefs (user_id, site_id, is_active)
                     VALUES (:user_id, :site_id, :is_active)
-                    ON CONFLICT(user_id, site_id) DO UPDATE SET is_active = :is_active
+                    ON CONFLICT (user_id, site_id) DO UPDATE SET
+                        is_active = EXCLUDED.is_active
                     """
                 ),
                 {"user_id": current_user.id, "site_id": site_id, "is_active": is_active},
@@ -715,7 +721,7 @@ def list_sites(
                 """
                 SELECT id, site_name, url, is_default, is_active
                 FROM scraper_sites
-                WHERE user_id = :user_id AND is_default = 0
+                WHERE user_id = :user_id AND is_default = FALSE
                 ORDER BY site_name
                 """
             ),
