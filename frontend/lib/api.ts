@@ -17,15 +17,21 @@ function authHeader(token?: string) {
 
 export function getStoredToken(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("auth_token") || localStorage.getItem("crawler_token");
+  return (
+    localStorage.getItem("auth_token") ??
+    localStorage.getItem("crawler_token") ??
+    null
+  );
 }
 
 export function setStoredToken(token: string) {
   if (typeof window === "undefined") return;
   localStorage.setItem("auth_token", token);
-  localStorage.setItem("crawler_token", token);
-  localStorage.setItem("token", token);
-  document.cookie = `crawler_token=${token}; Path=/; SameSite=Lax`;
+  localStorage.removeItem("crawler_token");
+  localStorage.removeItem("token");
+  const maxAge = 30 * 24 * 60 * 60;
+  document.cookie = `auth_token=${token}; Path=/; SameSite=Lax; Max-Age=${maxAge}`;
+  document.cookie = "crawler_token=; Path=/; Max-Age=0";
 }
 
 export async function apiFetch(path: string, options: RequestInit = {}) {
@@ -42,12 +48,10 @@ export async function apiFetch(path: string, options: RequestInit = {}) {
   });
 
   if (res.status === 401 && typeof window !== "undefined") {
-    localStorage.removeItem("auth_token");
-    localStorage.removeItem("crawler_token");
-    localStorage.removeItem("token");
-    localStorage.removeItem("crawler_user_id");
-    localStorage.removeItem("backend_user_id");
-    localStorage.removeItem("user_id");
+    ["auth_token", "crawler_token", "token", "crawler_user_id", "backend_user_id", "user_id"].forEach(
+      (k) => localStorage.removeItem(k),
+    );
+    document.cookie = "auth_token=; Path=/; Max-Age=0";
     document.cookie = "crawler_token=; Path=/; Max-Age=0";
     window.location.href = "/login";
     throw new Error("Unauthorized");
@@ -83,8 +87,8 @@ export async function getMe(token: string) {
   return res.json();
 }
 
-export async function getGoogleAuthUrl(userId: string, returnTo?: string) {
-  const query = new URLSearchParams({ user_id: userId });
+export function getGoogleAuthUrl(returnTo?: string) {
+  const query = new URLSearchParams();
   if (returnTo) query.set("return_to", returnTo);
   return { auth_url: `${API_URL}/auth/google?${query.toString()}` };
 }
