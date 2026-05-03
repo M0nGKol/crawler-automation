@@ -123,7 +123,7 @@ export default function Home() {
             justifyContent: "center",
           }}
         >
-          <Link href="/onboarding" className="btn-sakura" style={{ textDecoration: "none" }}>
+          <Link href="/login" className="btn-sakura" style={{ textDecoration: "none" }}>
             {t("landing.cta.start")}
           </Link>
           <Link href="/login" className="btn-ghost" style={{ textDecoration: "none" }}>

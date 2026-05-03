@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime
+
+from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, text
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship, sessionmaker
@@ -88,6 +89,20 @@ class ScraperSite(Base):
     user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
 
     user: Mapped[User | None] = relationship("User")
+
+
+class OAuthState(Base):
+    """Persistent OAuth state tokens — replaces in-memory dict so multi-instance deploys work."""
+
+    __tablename__ = "oauth_states"
+
+    state: Mapped[str] = mapped_column(String, primary_key=True)
+    return_to: Mapped[str] = mapped_column(String, default="/dashboard", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
 
 def get_db():

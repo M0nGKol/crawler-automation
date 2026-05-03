@@ -12,7 +12,9 @@ export function middleware(request: NextRequest) {
   }
 
   if (protectedRoutes.some((route) => pathname.startsWith(route))) {
-    const token = request.cookies.get("crawler_token")?.value;
+    const token =
+      request.cookies.get("auth_token")?.value ??
+      request.cookies.get("crawler_token")?.value;
     if (!token) {
       const url = request.nextUrl.clone();
       url.pathname = "/login";

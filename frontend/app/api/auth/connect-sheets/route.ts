@@ -7,18 +7,7 @@ const apiUrl =
   "https://crawler-automation-1.onrender.com";
 
 export async function GET(request: NextRequest) {
-  const userId = request.nextUrl.searchParams.get("user_id");
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Missing user_id query parameter" },
-      { status: 400 },
-    );
-  }
-
-  const returnTo = request.nextUrl.searchParams.get("return_to") || "/onboarding?step=3";
-  const query = new URLSearchParams({
-    user_id: userId,
-    return_to: returnTo,
-  });
+  const returnTo = request.nextUrl.searchParams.get("return_to") || "/dashboard";
+  const query = new URLSearchParams({ return_to: returnTo });
   return NextResponse.json({ auth_url: `${apiUrl}/auth/google?${query.toString()}` });
 }

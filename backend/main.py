@@ -5,11 +5,10 @@ import logging
 import os
 import re
 import secrets
-import time
 import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -41,15 +40,21 @@ from auth import (
     verify_jwt,
     verify_password,
 )
-from database import RunLog, ScraperSite, SessionLocal, User, get_db, init_db
+from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
 from mvp import run_scraper
 from onboarding import setup_new_user_workspace
 from pipeline import run_pipeline
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
-_oauth_states: dict[str, float | str] = {}
+INTERNAL_ADMIN_KEY = os.getenv("INTERNAL_ADMIN_KEY", "")
 log = logging.getLogger(__name__)
+
+
+def _require_internal_key(x_internal_key: str | None = Header(default=None)) -> None:
+    """Guard for legacy email/password endpoints — only accessible with a server-side key."""
+    if not INTERNAL_ADMIN_KEY or x_internal_key != INTERNAL_ADMIN_KEY:
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _normalize_return_to(return_to: str | None) -> str:
@@ -198,19 +203,6 @@ def load_sites_from_yaml() -> list[dict[str, Any]]:
     return sites
 
 
-def _cleanup_oauth_states() -> None:
-    now = time.time()
-    for key in list(_oauth_states.keys()):
-        if key.startswith("uid_"):
-            continue
-        if key.startswith("return_to_"):
-            continue
-        if now - _oauth_states[key] > 600:
-            _oauth_states.pop(key, None)
-            _oauth_states.pop(f"uid_{key}", None)
-            _oauth_states.pop(f"return_to_{key}", None)
-
-
 def _require_user_from_jwt(authorization: str | None, db: Session) -> User:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -250,7 +242,11 @@ def auth_sync(payload: SyncRequest, db: Session = Depends(get_db)) -> dict[str, 
 
 
 @app.post("/auth/register")
-def auth_register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+def auth_register(
+    payload: RegisterRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_internal_key),
+) -> dict[str, str]:
     exists = db.query(User).filter(User.email == payload.email).first()
     if exists:
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -269,20 +265,18 @@ def auth_register(payload: RegisterRequest, db: Session = Depends(get_db)) -> di
 
 @app.get("/auth/google")
 def auth_google(
-    user_id: str = Query(...),
     return_to: str = Query(default="/dashboard"),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    _cleanup_oauth_states()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db.query(OAuthState).filter(OAuthState.created_at < cutoff).delete()
+    db.commit()
+
     state = secrets.token_urlsafe(32)
-    _oauth_states[state] = time.time()
-    _oauth_states[f"uid_{state}"] = user_id
-    _oauth_states[f"return_to_{state}"] = _normalize_return_to(return_to)
-    auth_url = get_google_auth_url(state)
-    return RedirectResponse(url=auth_url)
+    db.add(OAuthState(state=state, return_to=_normalize_return_to(return_to)))
+    db.commit()
+
+    return RedirectResponse(url=get_google_auth_url(state))
 
 
 @app.get("/auth/google/config")
@@ -301,55 +295,71 @@ async def auth_google_callback(
     db: Session = Depends(get_db),
 ):
     try:
-        _cleanup_oauth_states()
-        ts = _oauth_states.get(state)
-        if not ts or (time.time() - ts > 600):
-            raise ValueError("Invalid or expired state")
-        user_id = _oauth_states.get(f"uid_{state}")
-        if not user_id:
-            raise ValueError("Missing user for OAuth state")
-        return_to = _normalize_return_to(_oauth_states.get(f"return_to_{state}"))
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
 
-        _oauth_states.pop(state, None)
-        _oauth_states.pop(f"uid_{state}", None)
-        _oauth_states.pop(f"return_to_{state}", None)
+        state_record = db.query(OAuthState).filter(OAuthState.state == state).first()
+        if not state_record:
+            raise ValueError("Invalid or expired OAuth state")
+        created_at = state_record.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at < cutoff:
+            db.delete(state_record)
+            db.commit()
+            raise ValueError("OAuth state expired — please try signing in again")
+
+        return_to = _normalize_return_to(state_record.return_to)
+        db.delete(state_record)
+        db.query(OAuthState).filter(OAuthState.created_at < cutoff).delete()
+        db.commit()
 
         token = exchange_code_for_token(code)
-        _ = get_user_info(token)
+        user_info = get_user_info(token)
         encrypted_token = encrypt_token(token)
 
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise ValueError("User not found")
+        email = user_info.get("email")
+        name = user_info.get("name")
+        if not email:
+            raise ValueError("Google did not return an email address")
 
-        workspace = await setup_new_user_workspace(
-            user=user,
-            encrypted_token=encrypted_token,
-            company=user.company or user.email,
-            db=db,
-        )
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            user = User(email=email, name=name, role="admin")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        if not user.sheet_id:
+            await setup_new_user_workspace(
+                user=user,
+                encrypted_token=encrypted_token,
+                company=name or email,
+                db=db,
+            )
+        else:
+            user.google_token = encrypted_token
+            user.last_login = datetime.now(timezone.utc)
+            db.commit()
 
         jwt_token = create_jwt(user.id)
-
-        separator = "&" if "?" in return_to else "?"
         url = (
-            f"{FRONTEND_URL}{return_to}{separator}"
-            f"token={urllib.parse.quote(jwt_token, safe='')}"
-            f"&google_connected=true"
-            f"&user_id={user.id}"
-            f"&sheet_url={urllib.parse.quote(workspace['sheet_url'], safe='')}"
-            f"&sheet_title={urllib.parse.quote(workspace['sheet_title'], safe='')}"
+            f"{FRONTEND_URL}/auth/callback"
+            f"?token={urllib.parse.quote(jwt_token, safe='')}"
+            f"&return_to={urllib.parse.quote(return_to, safe='')}"
+            f"&user_id={urllib.parse.quote(user.id, safe='')}"
         )
         return RedirectResponse(url=url)
     except Exception as exc:
         error = urllib.parse.quote(str(exc), safe="")
-        return RedirectResponse(
-            url=f"{FRONTEND_URL}/onboarding?error={error}"
-        )
+        return RedirectResponse(url=f"{FRONTEND_URL}/login?error={error}")
 
 
 @app.post("/auth/login")
-def auth_login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+def auth_login(
+    payload: LoginRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_internal_key),
+) -> dict[str, str]:
     user = db.query(User).filter(User.email == payload.email).first()
     if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
