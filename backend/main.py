@@ -24,7 +24,6 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Qu
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, HttpUrl
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -42,7 +41,6 @@ from auth import (
 )
 from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
-from mvp import run_scraper
 from onboarding import setup_new_user_workspace
 from pipeline import run_pipeline
 
@@ -84,20 +82,11 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Health Care Crawler API", lifespan=lifespan)
 
 # ── CORS ────────────────────────────────────────────────────────────────
-_allowed_origins = [o for o in [
-    FRONTEND_URL,                                           # e.g. https://crawler-automation.vercel.app
-    os.getenv("NEXTAUTH_URL", ""),                         # mirror of FRONTEND_URL used by NextAuth
-    "https://crawler-automation.vercel.app",               # explicit production fallback
-    "https://crawler-automation-1.onrender.com",           # Render backend
-    "http://localhost:3000",                               # local dev only
-] if o]
-
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
+    allow_origins=["http://localhost:3000"],
+    allow_origin_regex=r"https://crawler-automation[\w-]*\.vercel\.app",
     allow_credentials=True,
-    # Explicitly include PUT/OPTIONS for site toggle preflight + request.
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -141,9 +130,6 @@ class NewSiteRequest(BaseModel):
     url: str
     site_name: str
 
-
-class SiteToggleRequest(BaseModel):
-    is_active: bool
 
 
 def _slugify_site_name(raw: str) -> str:
@@ -569,19 +555,6 @@ def create_sites(
     return {"message": "Sites config updated"}
 
 
-@app.put("/sites/{site_id}")
-def toggle_site(
-    site_id: str,
-    payload: dict[str, Any],
-    authorization: str | None = Header(default=None),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Toggle endpoint — state is maintained client-side and sent with /run request."""
-    current_user = _require_user_from_jwt(authorization, db)
-    is_active = bool(payload.get("is_active", True))
-    log.info("[TOGGLE] site_id=%s is_active=%s user=%s", site_id, is_active, current_user.id)
-    return {"success": True, "site_id": site_id, "is_active": is_active}
-
 
 @app.post("/sites/add-url")
 def add_site_url(
@@ -655,58 +628,17 @@ def list_sites(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Return YAML default sites + active custom sites for current user."""
+    """Return YAML default sites + custom sites for the current user."""
     user = _require_user_from_jwt(authorization, db)
     default_sites = load_sites_from_yaml()
 
-    # Apply per-user activation preferences for default sites.
-    pref_map: dict[str, bool] = {}
-    try:
-        prefs = db.execute(
-            text(
-                """
-                SELECT site_id, is_active
-                FROM user_site_prefs
-                WHERE user_id = :user_id
-                """
-            ),
-            {"user_id": user.id},
-        ).mappings().all()
-        pref_map = {str(r["site_id"]): bool(r["is_active"]) for r in prefs}
-    except Exception:
-        pref_map = {}
-
-    custom_sites: list[dict[str, Any]] = []
-    try:
-        # Return all custom sites (active + inactive) so the UI can toggle them.
-        rows = db.execute(
-            text(
-                """
-                SELECT id, site_name, url, is_default, is_active
-                FROM scraper_sites
-                WHERE user_id = :user_id AND is_default = FALSE
-                ORDER BY site_name
-                """
-            ),
-            {"user_id": user.id},
-        ).mappings().all()
-        custom_sites = [
-            {
-                "id": row.get("id"),
-                "site_name": row.get("site_name", ""),
-                "url": row.get("url", ""),
-                "type": "custom",
-                "is_default": bool(row.get("is_default", False)),
-                "is_active": bool(row.get("is_active", True)),
-            }
-            for row in rows
-        ]
-    except Exception:
-        custom_sites = []
-
-    for site in default_sites:
-        if str(site["id"]) in pref_map:
-            site["is_active"] = bool(pref_map[str(site["id"])])
+    custom_rows = (
+        db.query(ScraperSite)
+        .filter(ScraperSite.user_id == user.id, ScraperSite.is_default.is_(False))
+        .order_by(ScraperSite.site_name)
+        .all()
+    )
+    custom_sites = [_format_site(row) for row in custom_rows]
 
     return {"sites": default_sites + custom_sites}
 

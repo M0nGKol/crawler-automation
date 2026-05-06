@@ -169,6 +169,7 @@ export default function DashboardPage() {
 
   // Sites
   const [sites, setSites] = useState<SiteRecord[]>([]);
+  const [activeSiteIds, setActiveSiteIds] = useState<Set<string>>(new Set());
   const [sitesLoading, setSitesLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
 
@@ -201,6 +202,7 @@ export default function DashboardPage() {
         setSitesLoading(true);
         const { sites: siteList } = await getSitesList(token);
         setSites(siteList);
+        setActiveSiteIds(new Set(siteList.filter((s) => s.is_active).map((s) => s.id)));
       } catch {
         /* non-fatal */
       } finally {
@@ -233,7 +235,7 @@ export default function DashboardPage() {
     setRunError(null);
 
     try {
-      const { run_id } = await startRun(token ?? undefined);
+      const { run_id } = await startRun(token ?? undefined, [...activeSiteIds]);
 
       // Poll every 3 seconds
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -452,7 +454,16 @@ export default function DashboardPage() {
             ) : sites.length === 0 ? (
               <p style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>No sites found.</p>
             ) : (
-              <SitesList sites={sites} />
+              <SitesList
+                sites={sites}
+                onToggle={(id, active) =>
+                  setActiveSiteIds((prev) => {
+                    const next = new Set(prev);
+                    active ? next.add(id) : next.delete(id);
+                    return next;
+                  })
+                }
+              />
             )}
           </div>
         </div>

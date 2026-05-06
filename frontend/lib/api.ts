@@ -184,11 +184,14 @@ export async function addCustomSite(token: string, siteName: string, url: string
   return res.json() as Promise<SiteRecord>;
 }
 
-export async function startRun(token?: string): Promise<{ run_id: string; status: string }> {
+export async function startRun(
+  token?: string,
+  sites?: string[],
+): Promise<{ run_id: string; status: string }> {
   const res = await apiFetch("/run", {
     method: "POST",
     headers: { ...authHeader(token) },
-    body: JSON.stringify({}),
+    body: JSON.stringify(sites?.length ? { sites } : {}),
   });
   if (!res.ok) throw new Error("Failed to trigger run");
   return res.json() as Promise<{ run_id: string; status: string }>;
@@ -198,9 +201,4 @@ export async function getRun(runId: string): Promise<RunStatus> {
   const res = await apiFetch(`/run/${runId}`, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch run status");
   return res.json() as Promise<RunStatus>;
-}
-
-// Keep the legacy triggerRun for any callers still using it
-export async function triggerRun(token?: string) {
-  return startRun(token);
 }

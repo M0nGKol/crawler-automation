@@ -1,16 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { type SiteRecord, getStoredToken, toggleSite } from "@/lib/api";
+import { type SiteRecord } from "@/lib/api";
 
 function Toggle({
   checked,
   onChange,
-  disabled,
 }: {
   checked: boolean;
   onChange: () => void;
-  disabled?: boolean;
 }) {
   return (
     <button
@@ -18,20 +16,18 @@ function Toggle({
       role="switch"
       aria-checked={checked}
       onClick={onChange}
-      disabled={disabled}
       style={{
         width: "44px",
         height: "24px",
         borderRadius: "12px",
         border: "none",
-        cursor: disabled ? "not-allowed" : "pointer",
+        cursor: "pointer",
         background: checked
           ? "linear-gradient(135deg, var(--color-sakura, #e879a0), var(--color-sakura-vivid, #db2777))"
           : "rgba(255,255,255,0.12)",
         position: "relative",
         transition: "background 0.2s ease",
         flexShrink: 0,
-        opacity: disabled ? 0.6 : 1,
         padding: 0,
       }}
     >
@@ -55,34 +51,25 @@ function Toggle({
 
 const COL_HEADERS = ["SITE NAME", "URL", "TYPE", "LAST RUN", "ACTIVE"] as const;
 
-export function SitesList({ sites: propSites }: { sites: SiteRecord[] }) {
+export function SitesList({
+  sites: propSites,
+  onToggle,
+}: {
+  sites: SiteRecord[];
+  onToggle?: (siteId: string, isActive: boolean) => void;
+}) {
   const [sites, setSites] = useState<SiteRecord[]>(propSites);
-  const [toggling, setToggling] = useState<string | null>(null);
 
   useEffect(() => {
     setSites(propSites);
   }, [propSites]);
 
-  const handleToggle = async (site: SiteRecord) => {
-    if (toggling) return;
+  const handleToggle = (site: SiteRecord) => {
     const newActive = !site.is_active;
-
     setSites((prev) =>
       prev.map((s) => (s.id === site.id ? { ...s, is_active: newActive } : s)),
     );
-    setToggling(site.id);
-
-    try {
-      const token = getStoredToken();
-      if (!token) throw new Error("Not authenticated");
-      await toggleSite(token, site.id, newActive);
-    } catch {
-      setSites((prev) =>
-        prev.map((s) => (s.id === site.id ? { ...s, is_active: site.is_active } : s)),
-      );
-    } finally {
-      setToggling(null);
-    }
+    onToggle?.(site.id, newActive);
   };
 
   if (sites.length === 0) {
@@ -134,41 +121,19 @@ export function SitesList({ sites: propSites }: { sites: SiteRecord[] }) {
                 (e.currentTarget as HTMLTableRowElement).style.background = "transparent";
               }}
             >
-              {/* Site name */}
-              <td
-                style={{
-                  padding: "12px 14px",
-                  fontWeight: 500,
-                  color: "var(--color-text-primary)",
-                  whiteSpace: "nowrap",
-                }}
-              >
+              <td style={{ padding: "12px 14px", fontWeight: 500, color: "var(--color-text-primary)", whiteSpace: "nowrap" }}>
                 {site.site_name}
               </td>
 
-              {/* URL */}
-              <td
-                style={{
-                  padding: "12px 14px",
-                  color: "var(--color-text-muted)",
-                  maxWidth: "240px",
-                }}
-              >
+              <td style={{ padding: "12px 14px", color: "var(--color-text-muted)", maxWidth: "240px" }}>
                 <span
                   title={site.url}
-                  style={{
-                    display: "block",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    fontSize: "0.82rem",
-                  }}
+                  style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: "0.82rem" }}
                 >
                   {site.url}
                 </span>
               </td>
 
-              {/* Type badge */}
               <td style={{ padding: "12px 14px", whiteSpace: "nowrap" }}>
                 <span
                   style={{
@@ -176,12 +141,8 @@ export function SitesList({ sites: propSites }: { sites: SiteRecord[] }) {
                     fontWeight: 700,
                     padding: "3px 9px",
                     borderRadius: "5px",
-                    background: site.is_default
-                      ? "rgba(129,140,248,0.15)"
-                      : "rgba(232,121,169,0.15)",
-                    color: site.is_default
-                      ? "var(--color-fuji, #818cf8)"
-                      : "var(--color-sakura, #e879a0)",
+                    background: site.is_default ? "rgba(129,140,248,0.15)" : "rgba(232,121,169,0.15)",
+                    color: site.is_default ? "var(--color-fuji, #818cf8)" : "var(--color-sakura, #e879a0)",
                     textTransform: "uppercase",
                     letterSpacing: "0.04em",
                   }}
@@ -190,15 +151,7 @@ export function SitesList({ sites: propSites }: { sites: SiteRecord[] }) {
                 </span>
               </td>
 
-              {/* Last run */}
-              <td
-                style={{
-                  padding: "12px 14px",
-                  color: "var(--color-text-muted)",
-                  fontSize: "0.82rem",
-                  whiteSpace: "nowrap",
-                }}
-              >
+              <td style={{ padding: "12px 14px", color: "var(--color-text-muted)", fontSize: "0.82rem", whiteSpace: "nowrap" }}>
                 {site.last_run_at
                   ? new Date(site.last_run_at).toLocaleString("ja-JP", {
                       month: "short",
@@ -209,13 +162,8 @@ export function SitesList({ sites: propSites }: { sites: SiteRecord[] }) {
                   : "—"}
               </td>
 
-              {/* Toggle */}
               <td style={{ padding: "12px 14px" }}>
-                <Toggle
-                  checked={site.is_active}
-                  onChange={() => void handleToggle(site)}
-                  disabled={toggling === site.id}
-                />
+                <Toggle checked={site.is_active} onChange={() => handleToggle(site)} />
               </td>
             </tr>
           ))}
