@@ -24,7 +24,7 @@ from typing import Any
 
 from app.config import load_settings, load_sites_config, merge_sites, parse_sites_yaml
 from clients.anthropic_client import get_anthropic_client
-from database import ScraperSite, SessionLocal, User, UserSitePref
+from database import ScraperSite, SessionLocal, User
 from models import JobMasked, JobRaw
 from output.csv_sink import save_csv
 from output.sheets_sink import write_to_sheets
@@ -215,6 +215,7 @@ def _build_output_models(
 async def run_pipeline(
     user_id: str | None = None,
     run_id: str | None = None,
+    selected_sites: list[str] | None = None,
 ) -> dict[str, Any]:
     start = time.monotonic()
     settings = load_settings()
@@ -239,36 +240,8 @@ async def run_pipeline(
 
     sites = merge_sites(default_sites, user_sites)
 
-    # If a user has toggled *default* sites in the UI, respect that here too.
-    # user_site_prefs stores per-user overrides; apply them to the merged site config.
-    pref_map: dict[str, bool] = {}
-    if user_id:
-        db_prefs = SessionLocal()
-        try:
-            prefs = db_prefs.query(UserSitePref).filter(UserSitePref.user_id == user_id).all()
-            pref_map = {p.site_id: bool(p.is_active) for p in prefs}
-            for site_name in default_sites.keys():
-                if site_name in pref_map:
-                    sites[site_name]["active"] = pref_map[site_name]
-        except Exception as exc:
-            log.error("Failed to load user site prefs: %s", exc)
-        finally:
-            db_prefs.close()
-
     # Seed default sites into DB (Task 7)
     _seed_scraper_sites(default_sites)
-
-    # Filter to only active sites from config and DB, logging skips without
-    # treating them as scraper failures.
-    db_active_map: dict[str, bool] = {}
-    db = SessionLocal()
-    try:
-        rows = db.query(ScraperSite.site_name, ScraperSite.is_active).all()
-        db_active_map = {row.site_name: bool(row.is_active) for row in rows}
-    except Exception:
-        pass
-    finally:
-        db.close()
 
     active_sites: dict[str, Any] = {}
     site_reports: dict[str, dict[str, str]] = {}
@@ -289,15 +262,18 @@ async def run_pipeline(
             _update_site_status(site_name, "skipped")
             continue
 
-        if site_name in db_active_map and db_active_map[site_name] is False and site_name not in pref_map:
-            log.info("Skipping %s: marked inactive", site_name)
-            site_reports[site_name] = {"status": "skipped", "reason": "inactive"}
-            _update_site_status(site_name, "skipped")
-            continue
-
         active_sites[site_name] = cfg
 
     sites = active_sites
+
+    # If user selected specific sites to scrape, filter to only those.
+    if selected_sites:
+        selected_set = set(selected_sites)
+        for site_name in list(sites.keys()):
+            if site_name not in selected_set:
+                site_reports[site_name] = {"status": "skipped", "reason": "not_selected"}
+                _update_site_status(site_name, "skipped")
+                del sites[site_name]
 
     sites_attempted = len(sites)
     log.info(
@@ -472,5 +448,8 @@ async def run_pipeline(
     }
 
 
-def run_scraper(user_id: str | None = None) -> dict[str, Any]:
-    return asyncio.run(run_pipeline(user_id=user_id))
+def run_scraper(
+    user_id: str | None = None,
+    selected_sites: list[str] | None = None,
+) -> dict[str, Any]:
+    return asyncio.run(run_pipeline(user_id=user_id, selected_sites=selected_sites))

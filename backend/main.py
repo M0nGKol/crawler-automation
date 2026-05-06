@@ -40,7 +40,7 @@ from auth import (
     verify_jwt,
     verify_password,
 )
-from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, UserSitePref, get_db, init_db
+from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
 from mvp import run_scraper
 from onboarding import setup_new_user_workspace
@@ -88,7 +88,7 @@ _allowed_origins = [o for o in [
     FRONTEND_URL,                                           # e.g. https://crawler-automation.vercel.app
     os.getenv("NEXTAUTH_URL", ""),                         # mirror of FRONTEND_URL used by NextAuth
     "https://crawler-automation.vercel.app",               # explicit production fallback
-    "https://crawler-automation-1.onrender.com",           # Render backend (for same-origin browser calls)
+    "https://crawler-automation-1.onrender.com",           # Render backend
     "http://localhost:3000",                               # local dev only
 ] if o]
 
@@ -122,6 +122,7 @@ class SyncRequest(BaseModel):
 
 class RunRequest(BaseModel):
     user_id: str | None = None
+    sites: list[str] | None = None  # List of site names to scrape; if omitted, scrape all active sites
 
 
 class SitesPayload(BaseModel):
@@ -443,7 +444,11 @@ async def run_pipeline_endpoint(
         """Execute the pipeline and update the run_log when done."""
         _db = SessionLocal()
         try:
-            result = await run_pipeline(user_id=user.id if user else None, run_id=run_id)
+            result = await run_pipeline(
+                user_id=user.id if user else None,
+                run_id=run_id,
+                selected_sites=payload.sites,
+            )
             _log = _db.query(RunLog).filter(RunLog.id == run_id).first()
             if _log:
                 _log.finished_at = datetime.now(timezone.utc)
@@ -571,32 +576,10 @@ def toggle_site(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    """Toggle endpoint — state is maintained client-side and sent with /run request."""
     current_user = _require_user_from_jwt(authorization, db)
     is_active = bool(payload.get("is_active", True))
     log.info("[TOGGLE] site_id=%s is_active=%s user=%s", site_id, is_active, current_user.id)
-
-    # Default sites use YAML keys as `id` (not the DB row id), so detect defaults
-    # by checking the YAML site map.
-    default_site_names = set(_load_default_sites().keys())
-    if site_id in default_site_names:
-        # Persist user preference for default sites via ORM upsert.
-        pref = db.query(UserSitePref).filter_by(user_id=current_user.id, site_id=site_id).first()
-        if pref:
-            pref.is_active = is_active
-        else:
-            db.add(UserSitePref(user_id=current_user.id, site_id=site_id, is_active=is_active))
-        db.commit()
-        return {"success": True, "site_id": site_id, "is_active": is_active}
-
-    # Custom site: update the scraper_sites row by DB id.
-    site = db.query(ScraperSite).filter(ScraperSite.id == site_id).first()
-    if not site:
-        raise HTTPException(status_code=404, detail="Site not found")
-    if site.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorised")
-
-    site.is_active = is_active
-    db.commit()
     return {"success": True, "site_id": site_id, "is_active": is_active}
 
 
