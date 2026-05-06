@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
 import secrets
+import traceback
 import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
@@ -629,18 +629,34 @@ def list_sites(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Return YAML default sites + custom sites for the current user."""
-    user = _require_user_from_jwt(authorization, db)
-    default_sites = load_sites_from_yaml()
+    try:
+        user = _require_user_from_jwt(authorization, db)
+        default_sites = load_sites_from_yaml()
 
-    custom_rows = (
-        db.query(ScraperSite)
-        .filter(ScraperSite.user_id == user.id, ScraperSite.is_default.is_(False))
-        .order_by(ScraperSite.site_name)
-        .all()
-    )
-    custom_sites = [_format_site(row) for row in custom_rows]
+        # Only return custom (non-default) sites owned by this user.
+        # If the user has no custom sites yet, this simply returns an empty list.
+        custom_rows = (
+            db.query(
+                ScraperSite.id,
+                ScraperSite.site_name,
+                ScraperSite.url,
+                ScraperSite.is_default,
+                ScraperSite.is_active,
+                ScraperSite.last_status,
+                ScraperSite.last_run_at,
+            )
+            .filter(ScraperSite.user_id == user.id, ScraperSite.is_default.is_(False))
+            .order_by(ScraperSite.site_name)
+            .all()
+        )
+        custom_sites = [_format_site_row(row) for row in custom_rows]
 
-    return {"sites": default_sites + custom_sites}
+        return {"sites": default_sites + custom_sites}
+    except Exception as exc:  # pragma: no cover - defensive logging
+        # Print full traceback to stdout/stderr for Render logs and log with context.
+        traceback.print_exc()
+        log.exception("Unhandled error in /sites/list: %s", exc)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.delete("/sites/{site_id}")
@@ -677,6 +693,23 @@ def _format_site(site: ScraperSite) -> dict[str, Any]:
         "last_job_count": getattr(site, "last_job_count", 0),
         "consecutive_failures": getattr(site, "consecutive_failures", 0),
         "last_run_at": site.last_run_at.isoformat() if site.last_run_at else None,
+    }
+
+
+def _format_site_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "site_name": row.site_name,
+        "url": row.url,
+        "type": "custom" if not row.is_default else "default",
+        "mode": "db",
+        "is_default": row.is_default,
+        "is_active": row.is_active,
+        "last_status": row.last_status,
+        "status_note": "",
+        "last_job_count": 0,
+        "consecutive_failures": 0,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
     }
 
 

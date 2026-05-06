@@ -120,15 +120,6 @@ export async function getLogs(token: string) {
   return res.json();
 }
 
-export async function getSites(token: string) {
-  const res = await apiFetch("/sites", {
-    headers: { ...authHeader(token) },
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error("Failed to fetch sites");
-  return res.json();
-}
-
 export type SiteRecord = {
   id: string;
   site_name: string;
@@ -159,16 +150,6 @@ export async function getSitesList(token: string): Promise<{ sites: SiteRecord[]
   });
   if (!res.ok) throw new Error("Failed to fetch sites list");
   return res.json() as Promise<{ sites: SiteRecord[] }>;
-}
-
-export async function toggleSite(token: string, siteId: string, isActive: boolean) {
-  const res = await apiFetch(`/sites/${siteId}`, {
-    method: "PUT",
-    headers: { ...authHeader(token) },
-    body: JSON.stringify({ is_active: isActive }),
-  });
-  if (!res.ok) throw new Error("Failed to toggle site");
-  return res.json() as Promise<SiteRecord>;
 }
 
 export async function addCustomSite(token: string, siteName: string, url: string) {
