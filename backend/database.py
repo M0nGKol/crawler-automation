@@ -91,6 +91,19 @@ class ScraperSite(Base):
     user: Mapped[User | None] = relationship("User")
 
 
+class UserSitePref(Base):
+    """Per-user active/inactive override for default (YAML-seeded) sites."""
+
+    __tablename__ = "user_site_prefs"
+
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    site_id: Mapped[str] = mapped_column(String, primary_key=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class OAuthState(Base):
     """Persistent OAuth state tokens — replaces in-memory dict so multi-instance deploys work."""
 
