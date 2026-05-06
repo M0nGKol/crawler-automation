@@ -40,7 +40,7 @@ from auth import (
     verify_jwt,
     verify_password,
 )
-from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
+from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, UserSitePref, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
 from mvp import run_scraper
 from onboarding import setup_new_user_workspace
@@ -579,49 +579,13 @@ def toggle_site(
     # by checking the YAML site map.
     default_site_names = set(_load_default_sites().keys())
     if site_id in default_site_names:
-        # Persist user preference for default sites.
-        try:
-            db.execute(
-                text(
-                    """
-                    INSERT INTO user_site_prefs (user_id, site_id, is_active)
-                    VALUES (:user_id, :site_id, :is_active)
-                    ON CONFLICT (user_id, site_id) DO UPDATE SET
-                        is_active = EXCLUDED.is_active
-                    """
-                ),
-                {"user_id": current_user.id, "site_id": site_id, "is_active": is_active},
-            )
-            db.commit()
-        except Exception:
-            # Table might not exist yet.
-            db.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS user_site_prefs (
-                        user_id TEXT NOT NULL,
-                        site_id TEXT NOT NULL,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (user_id, site_id)
-                    )
-                    """
-                )
-            )
-            db.commit()
-            db.execute(
-                text(
-                    """
-                    INSERT INTO user_site_prefs (user_id, site_id, is_active)
-                    VALUES (:user_id, :site_id, :is_active)
-                    ON CONFLICT (user_id, site_id) DO UPDATE SET
-                        is_active = EXCLUDED.is_active
-                    """
-                ),
-                {"user_id": current_user.id, "site_id": site_id, "is_active": is_active},
-            )
-            db.commit()
-
+        # Persist user preference for default sites via ORM upsert.
+        pref = db.query(UserSitePref).filter_by(user_id=current_user.id, site_id=site_id).first()
+        if pref:
+            pref.is_active = is_active
+        else:
+            db.add(UserSitePref(user_id=current_user.id, site_id=site_id, is_active=is_active))
+        db.commit()
         return {"success": True, "site_id": site_id, "is_active": is_active}
 
     # Custom site: update the scraper_sites row by DB id.
@@ -762,27 +726,6 @@ def list_sites(
             site["is_active"] = bool(pref_map[str(site["id"])])
 
     return {"sites": default_sites + custom_sites}
-
-
-@app.put("/sites/{site_id}/toggle")
-def toggle_site(
-    site_id: str,
-    payload: SiteToggleRequest,
-    authorization: str | None = Header(default=None),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Toggle is_active for any site the user can see."""
-    user = _require_user_from_jwt(authorization, db)
-    site = db.query(ScraperSite).filter(ScraperSite.id == site_id).first()
-    if not site:
-        raise HTTPException(status_code=404, detail="Site not found")
-    # Allow toggling default sites and user's own custom sites
-    if not site.is_default and site.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not authorised")
-    site.is_active = payload.is_active
-    db.commit()
-    db.refresh(site)
-    return _format_site(site)
 
 
 @app.delete("/sites/{site_id}")
