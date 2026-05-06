@@ -105,19 +105,6 @@ class OAuthState(Base):
     )
 
 
-class UserSitePref(Base):
-    """Per-user toggles for default sites — overrides scraper_sites.is_active in the pipeline."""
-
-    __tablename__ = "user_site_prefs"
-
-    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
-    site_id: Mapped[str] = mapped_column(String, primary_key=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-
 def get_db():
     db = SessionLocal()
     try:
@@ -138,6 +125,11 @@ _SCRAPER_SITE_MIGRATIONS = [
     "ALTER TABLE scraper_sites ADD COLUMN consecutive_failures INTEGER DEFAULT 0",
 ]
 
+_POSTGRES_SCRAPER_SITE_MIGRATIONS = [
+    "ALTER TABLE scraper_sites ADD COLUMN IF NOT EXISTS last_job_count INTEGER DEFAULT 0",
+    "ALTER TABLE scraper_sites ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER DEFAULT 0",
+]
+
 
 def _run_migrations(conn) -> None:  # type: ignore[no-untyped-def]
     """Apply ALTER TABLE migrations that SQLite's create_all won't handle."""
@@ -150,8 +142,22 @@ def _run_migrations(conn) -> None:  # type: ignore[no-untyped-def]
             pass
 
 
+def _run_postgres_compat_migrations(conn) -> None:  # type: ignore[no-untyped-def]
+    """Apply idempotent Postgres migrations for columns expected by ORM models."""
+    for stmt in _POSTGRES_SCRAPER_SITE_MIGRATIONS:
+        try:
+            conn.execute(text(stmt))
+            conn.commit()
+        except Exception as exc:
+            log.warning("Postgres compat migration failed (%s): %s", stmt, exc)
+            conn.rollback()
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     if DATABASE_URL.startswith("sqlite"):
         with engine.connect() as conn:
             _run_migrations(conn)
+    elif engine.dialect.name == "postgresql":
+        with engine.connect() as conn:
+            _run_postgres_compat_migrations(conn)
