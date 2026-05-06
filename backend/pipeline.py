@@ -24,7 +24,7 @@ from typing import Any
 
 from app.config import load_settings, load_sites_config, merge_sites, parse_sites_yaml
 from clients.anthropic_client import get_anthropic_client
-from database import ScraperSite, SessionLocal, User
+from database import ScraperSite, SessionLocal, User, UserSitePref
 from models import JobMasked, JobRaw
 from output.csv_sink import save_csv
 from output.sheets_sink import write_to_sheets
@@ -83,11 +83,7 @@ def _seed_scraper_sites(sites_config: dict[str, Any]) -> None:
             )
             desired_active = bool(cfg.get("active", True))
             if existing:
-                # Keep DB activation state aligned with `config/sites.yaml`.
-                # Without this, enabling/disabling a default site in YAML may not take effect
-                # if the DB row was seeded earlier.
-                if bool(getattr(existing, "is_default", True)):
-                    existing.is_active = desired_active
+                pass  # Never overwrite is_active — user may have toggled via the UI
             else:
                 site = ScraperSite(
                     id=uuid.uuid4().hex,
@@ -244,28 +240,18 @@ async def run_pipeline(
     sites = merge_sites(default_sites, user_sites)
 
     # If a user has toggled *default* sites in the UI, respect that here too.
-    # Otherwise the UI would change but the pipeline would still scrape based on
-    # `scraper_sites.is_active`.
+    # user_site_prefs stores per-user overrides; apply them to the merged site config.
+    pref_map: dict[str, bool] = {}
     if user_id:
         db_prefs = SessionLocal()
         try:
-            prefs_rows = db_prefs.execute(
-                text(
-                    """
-                    SELECT site_id, is_active
-                    FROM user_site_prefs
-                    WHERE user_id = :user_id
-                    """
-                ),
-                {"user_id": user_id},
-            ).mappings().all()
-            pref_map = {str(r["site_id"]): bool(r["is_active"]) for r in prefs_rows}
+            prefs = db_prefs.query(UserSitePref).filter(UserSitePref.user_id == user_id).all()
+            pref_map = {p.site_id: bool(p.is_active) for p in prefs}
             for site_name in default_sites.keys():
                 if site_name in pref_map:
                     sites[site_name]["active"] = pref_map[site_name]
-        except Exception:
-            # Table may not exist yet; default YAML `active` will be used.
-            pass
+        except Exception as exc:
+            log.error("Failed to load user site prefs: %s", exc)
         finally:
             db_prefs.close()
 
@@ -303,7 +289,7 @@ async def run_pipeline(
             _update_site_status(site_name, "skipped")
             continue
 
-        if site_name in db_active_map and db_active_map[site_name] is False:
+        if site_name in db_active_map and db_active_map[site_name] is False and site_name not in pref_map:
             log.info("Skipping %s: marked inactive", site_name)
             site_reports[site_name] = {"status": "skipped", "reason": "inactive"}
             _update_site_status(site_name, "skipped")
