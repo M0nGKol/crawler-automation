@@ -36,11 +36,32 @@ function AddSiteModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || !url.trim()) { setError("Both fields required"); return; }
+    const trimmedName = name.trim().toLowerCase();
+    const trimmedUrl = url.trim();
+
+    if (!trimmedName || !trimmedUrl) {
+      setError("Both fields required");
+      return;
+    }
+    if (!/^[a-z0-9_]+$/.test(trimmedName)) {
+      setError("Site name must be lowercase letters, numbers, or underscores only");
+      return;
+    }
+    if (!/^https?:\/\//i.test(trimmedUrl)) {
+      setError("URL must start with http:// or https://");
+      return;
+    }
+    try {
+      new URL(trimmedUrl);
+    } catch {
+      setError("Invalid URL");
+      return;
+    }
+
     setLoading(true);
     setError("");
     try {
-      await onAdd(name.trim(), url.trim());
+      await onAdd(trimmedName, trimmedUrl);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add site");
@@ -225,6 +246,9 @@ export default function DashboardPage() {
     if (!token) throw new Error("Not logged in");
     const newSite = await addCustomSite(token, name, url);
     setSites((prev) => [...prev, newSite]);
+    if (newSite.is_active) {
+      setActiveSiteIds((prev) => new Set([...prev, newSite.site_name]));
+    }
   };
 
   // ── Run now with polling ─────────────────────────────────────────────────
