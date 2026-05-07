@@ -38,7 +38,8 @@ async def scrape_claude_fallback(page_or_html, site_name: str, config: dict[str,
         body = re.sub(r"<nav[\s>].*?</nav>", "", body, flags=re.DOTALL | re.IGNORECASE)
         body = re.sub(r"<footer[\s>].*?</footer>", "", body, flags=re.DOTALL | re.IGNORECASE)
 
-    body = body[:25_000]
+    max_chars = 5_000 if site_name == "osaka_university_hospital" else 25_000
+    body = body[:max_chars]
     log.info("  Sending %d chars to Claude for extraction …", len(body))
 
     try:
@@ -70,7 +71,16 @@ If there are no job listings on the page, return an empty array: []""",
         raw = response.content[0].text.strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw)
-        listings = json.loads(raw)
+
+        try:
+            listings = json.loads(raw)
+            if not isinstance(listings, list):
+                log.error("  Claude response is not a list: %s", type(listings))
+                return []
+        except json.JSONDecodeError as e:
+            log.error("  Failed to parse JSON from Claude: %s. Raw response: %s", e, raw[:200])
+            return []
+
         log.info("  Claude extracted %d listings", len(listings))
 
         return [
