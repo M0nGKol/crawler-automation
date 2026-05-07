@@ -202,7 +202,7 @@ export default function DashboardPage() {
         setSitesLoading(true);
         const { sites: siteList } = await getSitesList(token);
         setSites(siteList);
-        setActiveSiteIds(new Set(siteList.filter((s) => s.is_active).map((s) => s.id)));
+        setActiveSiteIds(new Set(siteList.filter((s) => s.is_active).map((s) => s.site_name)));
       } catch {
         /* non-fatal */
       } finally {
