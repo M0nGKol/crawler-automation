@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import httpx
+from bs4 import BeautifulSoup
 
 from domain.job import Job
 from scraping.strategies.claude_fallback_scraper import scrape_claude_fallback
@@ -40,7 +41,7 @@ DEFAULT_HEADERS = {
 }
 
 
-async def fetch_site_html(site_name: str, url: str, timeout_seconds: int = 30) -> dict[str, Any]:
+async def fetch_site_html(site_name: str, url: str, timeout_seconds: int = 30, custom_headers: dict[str, str] | None = None) -> dict[str, Any]:
     timeout = httpx.Timeout(float(timeout_seconds), connect=min(10.0, float(timeout_seconds)))
     verify: bool | ssl.SSLContext = True
     if site_name in SSL_SKIP_VERIFY_SITES:
@@ -50,9 +51,11 @@ async def fetch_site_html(site_name: str, url: str, timeout_seconds: int = 30) -
         ssl_context.set_ciphers("DEFAULT:@SECLEVEL=1")
         verify = ssl_context
 
+    headers = custom_headers if custom_headers else DEFAULT_HEADERS
+
     async with httpx.AsyncClient(
         timeout=timeout,
-        headers=DEFAULT_HEADERS,
+        headers=headers,
         follow_redirects=True,
         http2=True,
         verify=verify,
@@ -140,8 +143,108 @@ def _normalize_json_jobs(site_name: str, config: dict[str, Any], items: list[dic
     return [job for job in jobs if job.job_title or job.raw_facility or job.url]
 
 
+def _scrape_jobmedley_html(html: str, site_name: str, url: str) -> list[Job]:
+    """Scrape Job Medley site using BeautifulSoup HTML parsing."""
+    jobs: list[Job] = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        # Job Medley listings are in <a> tags with class like "job-list-item" or similar
+        job_elements = soup.find_all("a", class_=lambda x: x and "job" in x.lower())
+
+        if not job_elements:
+            # Fallback: look for links containing job info
+            job_elements = soup.find_all("a", href=lambda x: x and "/job/" in x.lower())
+
+        for elem in job_elements:
+            title = elem.get_text(strip=True)
+            href = elem.get("href", "")
+
+            if not title or not href:
+                continue
+
+            # Make relative URLs absolute
+            if href and not href.startswith(("http://", "https://")):
+                href = urljoin(url, href)
+
+            if title and href:
+                jobs.append(
+                    Job(
+                        source=site_name,
+                        mode="html_beautifulsoup",
+                        job_title=title,
+                        facility_name="",
+                        location="",
+                        job_description="",
+                        requirements="",
+                        salary_raw="",
+                        employment_type="",
+                        application_deadline="",
+                        contact_information="",
+                        url=href,
+                    )
+                )
+    except Exception as exc:
+        log.error("  BeautifulSoup parsing failed for %s: %s", site_name, exc)
+
+    return jobs
+
+
 async def scrape_site(site_name: str, config: dict[str, Any], claude: Any) -> dict[str, Any]:
     fetch_method = "html"
+
+    # Special handling for Job Medley — skip JSON API, use BeautifulSoup instead
+    if site_name.startswith("jobmedley"):
+        fetch_result = await fetch_site_html(site_name, config["url"], timeout_seconds=_site_timeout(config))
+        html = fetch_result["html"]
+        if not html:
+            raise ValueError(f"Empty HTML response (status={fetch_result['status']})")
+
+        jobs = _scrape_jobmedley_html(html, site_name, config["url"])
+        if not jobs:
+            log.warning("  BeautifulSoup found no jobs for %s, trying Claude fallback", site_name)
+            jobs = await scrape_claude_fallback(html, site_name, config, claude)
+            fetch_method = "beautifulsoup_fallback_claude"
+        else:
+            fetch_method = "beautifulsoup"
+
+        log.info(
+            "  ✓ %d listings collected from %s (status=%s, method=%s, bytes=%d)",
+            len(jobs),
+            site_name,
+            fetch_result["status"],
+            fetch_method,
+            len(html),
+        )
+        return _site_result(
+            site_name,
+            "success" if jobs else "no_jobs",
+            jobs,
+            fetch_method=fetch_method,
+            status_code=fetch_result["status"],
+        )
+
+    # Special handling for GUBBY_DR (guppy.jp) — JS-rendered site, needs browser
+    if site_name.startswith("gubby"):
+        browser_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://guppy.jp/",
+        }
+        fetch_result = await fetch_site_html(site_name, config["url"], timeout_seconds=_site_timeout(config), custom_headers=browser_headers)
+        html = fetch_result["html"]
+        log.info("  [GUBBY_DR] fetched %d bytes from %s", len(html), site_name)
+        log.debug("  [GUBBY_DR] first 500 chars: %s", html[:500])
+
+        if not html or len(html) < 500:
+            log.info("  [SKIP] %s - JS rendered site, needs Playwright", site_name)
+            return _site_result(site_name, "skipped", [], error="JS rendered site requires Playwright", status_code=fetch_result["status"])
+
+        if html.count("<script") > 10 and html.count("</body>") < 2:
+            log.info("  [SKIP] %s - JS rendered site, needs Playwright", site_name)
+            return _site_result(site_name, "skipped", [], error="JS rendered site requires Playwright", status_code=fetch_result["status"])
+
+    # Standard flow for other sites
     api_endpoint = config.get("api_endpoint")
     if api_endpoint:
         try:
@@ -198,6 +301,8 @@ async def scrape_with_retry(
             result["attempts"] = attempt
             result["duration_ms"] = int((time.monotonic() - started_at) * 1000)
             if result.get("jobs"):
+                return result
+            if result.get("status") == "skipped":
                 return result
             last_error = "no jobs found"
             log.warning("%s attempt %d: no jobs found, retrying...", site_name, attempt)
