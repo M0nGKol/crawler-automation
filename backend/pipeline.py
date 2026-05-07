@@ -102,6 +102,43 @@ def _seed_scraper_sites(sites_config: dict[str, Any]) -> None:
         db.close()
 
 
+def _load_selected_sites_from_db(
+    selected_sites: list[str],
+    *,
+    user_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Resolve selected site IDs that are not in YAML/user config from scraper_sites.
+    These DB-backed rows are scraped via the generic Claude fallback flow.
+    """
+    if not selected_sites:
+        return {}
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ScraperSite)
+            .filter(ScraperSite.site_name.in_(selected_sites))
+            .all()
+        )
+    finally:
+        db.close()
+
+    resolved: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if user_id and row.user_id not in {None, user_id}:
+            continue
+        if not row.url:
+            continue
+        resolved[row.site_name] = {
+            "url": row.url,
+            "type": "job_board",
+            "mode": "claude_fallback",
+            "active": bool(row.is_active),
+        }
+    return resolved
+
+
 def _update_site_status(
     site_name: str,
     status: str,
@@ -239,6 +276,16 @@ async def run_pipeline(
             db.close()
 
     sites = merge_sites(default_sites, user_sites)
+
+    # Resolve selected custom DB sites that are not present in YAML/user YAML.
+    if selected_sites:
+        missing_selected = [site for site in selected_sites if site not in sites]
+        if missing_selected:
+            db_selected = _load_selected_sites_from_db(
+                missing_selected,
+                user_id=user_id,
+            )
+            sites.update(db_selected)
 
     # Seed default sites into DB (Task 7)
     _seed_scraper_sites(default_sites)
@@ -450,6 +497,8 @@ async def run_pipeline(
 
 def run_scraper(
     user_id: str | None = None,
+    sites: list[str] | None = None,
     selected_sites: list[str] | None = None,
 ) -> dict[str, Any]:
-    return asyncio.run(run_pipeline(user_id=user_id, selected_sites=selected_sites))
+    chosen_sites = sites if sites is not None else selected_sites
+    return asyncio.run(run_pipeline(user_id=user_id, selected_sites=chosen_sites))

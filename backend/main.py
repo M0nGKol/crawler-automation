@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import traceback
+import asyncio
 import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
@@ -42,7 +43,7 @@ from auth import (
 from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
 from onboarding import setup_new_user_workspace
-from pipeline import run_pipeline
+from pipeline import run_scraper
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 INTERNAL_ADMIN_KEY = os.getenv("INTERNAL_ADMIN_KEY", "")
@@ -430,10 +431,10 @@ async def run_pipeline_endpoint(
         """Execute the pipeline and update the run_log when done."""
         _db = SessionLocal()
         try:
-            result = await run_pipeline(
+            result = await asyncio.to_thread(
+                run_scraper,
                 user_id=user.id if user else None,
-                run_id=run_id,
-                selected_sites=payload.sites,
+                sites=payload.sites,
             )
             _log = _db.query(RunLog).filter(RunLog.id == run_id).first()
             if _log:
