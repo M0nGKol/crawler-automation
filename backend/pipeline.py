@@ -139,6 +139,50 @@ def _load_selected_sites_from_db(
     return resolved
 
 
+def _resolve_selected_site_names(
+    selected_tokens: list[str] | None,
+    *,
+    user_id: str | None = None,
+) -> set[str]:
+    """
+    Resolve mixed selectors (site_name or ScraperSite.id) into canonical site_name values.
+    """
+    if not selected_tokens:
+        return set()
+
+    normalized_tokens = [str(token).strip() for token in selected_tokens if str(token).strip()]
+    if not normalized_tokens:
+        return set()
+
+    token_set = set(normalized_tokens)
+    token_lower_set = {token.lower() for token in normalized_tokens}
+
+    db = SessionLocal()
+    try:
+        rows = db.query(ScraperSite).all()
+    finally:
+        db.close()
+
+    resolved: set[str] = set()
+    for row in rows:
+        if user_id and row.user_id not in {None, user_id}:
+            continue
+
+        site_name = str(row.site_name).strip()
+        row_id = str(row.id).strip()
+        if not site_name:
+            continue
+
+        if (
+            row_id in token_set
+            or site_name in token_set
+            or site_name.lower() in token_lower_set
+        ):
+            resolved.add(site_name)
+
+    return resolved
+
+
 def _update_site_status(
     site_name: str,
     status: str,
@@ -315,7 +359,14 @@ async def run_pipeline(
 
     # If user selected specific sites to scrape, filter to only those.
     if selected_sites:
-        selected_set = set(selected_sites)
+        selected_set = _resolve_selected_site_names(selected_sites, user_id=user_id)
+        selected_set.update(
+            {
+                site.strip()
+                for site in selected_sites
+                if isinstance(site, str) and site.strip()
+            }
+        )
         for site_name in list(sites.keys()):
             if site_name not in selected_set:
                 site_reports[site_name] = {"status": "skipped", "reason": "not_selected"}
