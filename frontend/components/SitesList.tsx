@@ -69,7 +69,7 @@ export function SitesList({
     setSites((prev) =>
       prev.map((s) => (s.id === site.id ? { ...s, is_active: newActive } : s)),
     );
-    onToggle?.(site.id, newActive);
+    onToggle?.(site.site_name, newActive);
   };
 
   if (sites.length === 0) {
