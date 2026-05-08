@@ -23,6 +23,23 @@ log = logging.getLogger(__name__)
 RAW_TAB_NAME = "Jobs Raw"
 MASKED_TAB_NAME = "Jobs Masked"
 LOG_TAB_NAME = "Run Log"
+LEGACY_HEADERS = [
+    "id",
+    "source",
+    "raw_facility",
+    "masked_facility",
+    "job_title",
+    "location",
+    "job_description",
+    "requirements",
+    "salary_raw",
+    "salary_masked",
+    "employment_type",
+    "application_deadline",
+    "contact_information",
+    "url",
+    "scraped_at",
+]
 
 
 def _get_or_create_tab(
@@ -62,6 +79,89 @@ def _get_existing_ids(ws: "gspread.Worksheet") -> set[str]:
         return set(values[1:]) if len(values) > 1 else set()
     except Exception:
         return set()
+
+
+def _migrate_legacy_rows(
+    rows: list[list[str]],
+    *,
+    tab_name: str,
+) -> list[list[str]]:
+    """
+    Convert old 15-column rows into the canonical 13-column schema.
+    Also accepts already-canonical rows and normalizes/pads their length.
+    """
+    migrated: list[list[str]] = []
+    is_raw_tab = tab_name == RAW_TAB_NAME
+
+    for row in rows:
+        if not row or not any(cell.strip() for cell in row):
+            continue
+
+        if len(row) >= len(LEGACY_HEADERS):
+            padded = row + [""] * (len(LEGACY_HEADERS) - len(row))
+            facility = padded[2] if is_raw_tab else padded[3]
+            salary = padded[8] if is_raw_tab else padded[9]
+            migrated.append(
+                [
+                    padded[0],   # id
+                    padded[1],   # source
+                    facility,    # facility (raw or masked by tab)
+                    padded[4],   # job_title
+                    padded[5],   # location
+                    padded[6],   # job_description
+                    padded[7],   # requirements
+                    salary,      # salary (raw or masked by tab)
+                    padded[10],  # employment_type
+                    padded[11],  # application_deadline
+                    padded[12],  # contact_information
+                    padded[13],  # url
+                    padded[14],  # scraped_at
+                ]
+            )
+            continue
+
+        if len(row) >= len(JOB_HEADERS):
+            migrated.append(row[: len(JOB_HEADERS)])
+            continue
+
+        migrated.append(row + [""] * (len(JOB_HEADERS) - len(row)))
+
+    return migrated
+
+
+def _normalize_tab_schema(
+    ws: "gspread.Worksheet",
+    *,
+    tab_name: str,
+) -> None:
+    """
+    Ensure worksheet headers are canonical JOB_HEADERS.
+    If a legacy 15-column schema exists, migrate old rows in place.
+    """
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1", [JOB_HEADERS], value_input_option="USER_ENTERED")
+        return
+
+    existing_header = values[0]
+    if existing_header == JOB_HEADERS:
+        return
+
+    data_rows = values[1:]
+    if existing_header == LEGACY_HEADERS:
+        migrated_rows = _migrate_legacy_rows(data_rows, tab_name=tab_name)
+        ws.clear()
+        payload = [JOB_HEADERS, *migrated_rows] if migrated_rows else [JOB_HEADERS]
+        ws.update("A1", payload, value_input_option="USER_ENTERED")
+        log.info("[SHEETS] Migrated legacy tab schema for %s (%d rows)", tab_name, len(migrated_rows))
+        return
+
+    # Unknown/mixed header: preserve row values, but enforce the canonical header.
+    normalized_rows = _migrate_legacy_rows(data_rows, tab_name=tab_name)
+    ws.clear()
+    payload = [JOB_HEADERS, *normalized_rows] if normalized_rows else [JOB_HEADERS]
+    ws.update("A1", payload, value_input_option="USER_ENTERED")
+    log.warning("[SHEETS] Normalized non-standard header for %s", tab_name)
 
 
 def write_to_sheets(
@@ -124,6 +224,7 @@ def write_to_sheets(
 
         # ── Jobs Raw tab ─────────────────────────────────────────────────
         ws_raw = _get_or_create_tab(ss, RAW_TAB_NAME, JOB_HEADERS)
+        _normalize_tab_schema(ws_raw, tab_name=RAW_TAB_NAME)
         existing_raw_ids = _get_existing_ids(ws_raw)
         new_raw_rows = [
             j.to_row() for j in jobs_raw if j.id not in existing_raw_ids
@@ -136,6 +237,7 @@ def write_to_sheets(
 
         # ── Jobs Masked tab ───────────────────────────────────────────────
         ws_masked = _get_or_create_tab(ss, MASKED_TAB_NAME, JOB_HEADERS)
+        _normalize_tab_schema(ws_masked, tab_name=MASKED_TAB_NAME)
         existing_masked_ids = _get_existing_ids(ws_masked)
         new_masked_rows = [
             j.to_row() for j in jobs_masked if j.id not in existing_masked_ids
