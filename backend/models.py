@@ -26,6 +26,41 @@ JOB_HEADERS = [
     "scraped_at",
 ]
 
+# Explicit per-tab headers for Google Sheets.
+# Same field count/order as JOB_HEADERS, but tab-specific column names
+# to avoid ambiguity between raw and masked exports.
+RAW_JOB_HEADERS = [
+    "id",
+    "source",
+    "raw_facility",
+    "job_title",
+    "location",
+    "job_description",
+    "requirements",
+    "salary_raw",
+    "employment_type",
+    "application_deadline",
+    "contact_information",
+    "url",
+    "scraped_at",
+]
+
+MASKED_JOB_HEADERS = [
+    "id",
+    "source",
+    "masked_facility",
+    "job_title",
+    "location",
+    "job_description",
+    "requirements",
+    "salary_masked",
+    "employment_type",
+    "application_deadline",
+    "contact_information",
+    "url",
+    "scraped_at",
+]
+
 
 @dataclass
 class JobRaw:

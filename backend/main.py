@@ -43,6 +43,7 @@ from auth import (
 from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
 from onboarding import setup_new_user_workspace
+from output.sheets_sink import ensure_sheet_schema
 from pipeline import run_scraper
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
@@ -329,6 +330,15 @@ async def auth_google_callback(
             user.last_login = datetime.now(timezone.utc)
             db.commit()
 
+        # Keep a single user sheet, but enforce canonical tab schema on every OAuth login.
+        # This repairs legacy/wrongly-aligned columns for existing users immediately.
+        try:
+            if user.sheet_id:
+                gc = get_google_sheets_client(encrypted_token)
+                ensure_sheet_schema(sheet_id=user.sheet_id, gc=gc)
+        except Exception as migrate_exc:
+            log.warning("Sheet schema normalization failed for user %s: %s", user.id, migrate_exc)
+
         jwt_token = create_jwt(user.id)
         url = (
             f"{FRONTEND_URL}/auth/callback"
@@ -396,6 +406,32 @@ def auth_sheets_status(
         }
     except Exception:
         return {"connected": False}
+
+
+@app.post("/auth/sheets/repair")
+def auth_sheets_repair(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Force-normalize Jobs Raw / Jobs Masked headers and migrate legacy rows
+    in the authenticated user's single sheet.
+    """
+    user = _require_user_from_jwt(authorization, db)
+    if not user.google_token or not user.sheet_id:
+        raise HTTPException(status_code=400, detail="Google Sheets not connected")
+
+    try:
+        gc = get_google_sheets_client(user.google_token)
+        sheet_url = ensure_sheet_schema(sheet_id=user.sheet_id, gc=gc)
+        return {
+            "ok": True,
+            "sheet_id": user.sheet_id,
+            "sheet_url": sheet_url,
+            "message": "Sheet schema repaired",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Sheet repair failed: {exc}") from exc
 
 
 @app.post("/run")

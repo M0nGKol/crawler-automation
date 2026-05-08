@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from auth import get_google_sheets_client
 from database import SessionLocal, User
-from models import JOB_HEADERS, JobMasked, JobRaw
+from models import JOB_HEADERS, MASKED_JOB_HEADERS, RAW_JOB_HEADERS, JobMasked, JobRaw
 
 if TYPE_CHECKING:
     import gspread
@@ -138,28 +138,37 @@ def _normalize_tab_schema(
     Ensure worksheet headers are canonical JOB_HEADERS.
     If a legacy 15-column schema exists, migrate old rows in place.
     """
+    target_headers = RAW_JOB_HEADERS if tab_name == RAW_TAB_NAME else MASKED_JOB_HEADERS
+
     values = ws.get_all_values()
     if not values:
-        ws.update("A1", [JOB_HEADERS], value_input_option="USER_ENTERED")
+        ws.update("A1", [target_headers], value_input_option="USER_ENTERED")
         return
 
     existing_header = values[0]
-    if existing_header == JOB_HEADERS:
+    if existing_header == target_headers:
         return
 
     data_rows = values[1:]
     if existing_header == LEGACY_HEADERS:
         migrated_rows = _migrate_legacy_rows(data_rows, tab_name=tab_name)
         ws.clear()
-        payload = [JOB_HEADERS, *migrated_rows] if migrated_rows else [JOB_HEADERS]
+        payload = [target_headers, *migrated_rows] if migrated_rows else [target_headers]
         ws.update("A1", payload, value_input_option="USER_ENTERED")
         log.info("[SHEETS] Migrated legacy tab schema for %s (%d rows)", tab_name, len(migrated_rows))
+        return
+
+    if existing_header == JOB_HEADERS:
+        # Previous canonical header used generic field names (facility/salary).
+        # Data order is already correct; only rename headers per-tab.
+        ws.update("A1", [target_headers], value_input_option="USER_ENTERED")
+        log.info("[SHEETS] Updated generic header names for %s", tab_name)
         return
 
     # Unknown/mixed header: preserve row values, but enforce the canonical header.
     normalized_rows = _migrate_legacy_rows(data_rows, tab_name=tab_name)
     ws.clear()
-    payload = [JOB_HEADERS, *normalized_rows] if normalized_rows else [JOB_HEADERS]
+    payload = [target_headers, *normalized_rows] if normalized_rows else [target_headers]
     ws.update("A1", payload, value_input_option="USER_ENTERED")
     log.warning("[SHEETS] Normalized non-standard header for %s", tab_name)
 
@@ -223,7 +232,7 @@ def write_to_sheets(
         ss = gc.open_by_key(effective_sheet_id)
 
         # ── Jobs Raw tab ─────────────────────────────────────────────────
-        ws_raw = _get_or_create_tab(ss, RAW_TAB_NAME, JOB_HEADERS)
+        ws_raw = _get_or_create_tab(ss, RAW_TAB_NAME, RAW_JOB_HEADERS)
         _normalize_tab_schema(ws_raw, tab_name=RAW_TAB_NAME)
         existing_raw_ids = _get_existing_ids(ws_raw)
         new_raw_rows = [
@@ -236,7 +245,7 @@ def write_to_sheets(
             log.info("━━ Jobs Raw tab: no new rows to append (all duplicates)")
 
         # ── Jobs Masked tab ───────────────────────────────────────────────
-        ws_masked = _get_or_create_tab(ss, MASKED_TAB_NAME, JOB_HEADERS)
+        ws_masked = _get_or_create_tab(ss, MASKED_TAB_NAME, MASKED_JOB_HEADERS)
         _normalize_tab_schema(ws_masked, tab_name=MASKED_TAB_NAME)
         existing_masked_ids = _get_existing_ids(ws_masked)
         new_masked_rows = [
@@ -259,6 +268,29 @@ def write_to_sheets(
         log.error(f"[SHEETS] Failed to write: {exc}", exc_info=True)
         raise
     return None
+
+
+def ensure_sheet_schema(
+    *,
+    sheet_id: str,
+    gc: "gspread.Client",
+) -> str | None:
+    """
+    Ensure Jobs Raw / Jobs Masked tabs exist and use canonical JOB_HEADERS.
+    Used by OAuth/login flows so existing users are fixed even before first scrape run.
+    """
+    if not sheet_id:
+        return None
+
+    ss = gc.open_by_key(sheet_id)
+
+    ws_raw = _get_or_create_tab(ss, RAW_TAB_NAME, RAW_JOB_HEADERS)
+    _normalize_tab_schema(ws_raw, tab_name=RAW_TAB_NAME)
+
+    ws_masked = _get_or_create_tab(ss, MASKED_TAB_NAME, MASKED_JOB_HEADERS)
+    _normalize_tab_schema(ws_masked, tab_name=MASKED_TAB_NAME)
+
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}"
 
 
 # ── Backward-compat shim so old callers still work ────────────────────────
