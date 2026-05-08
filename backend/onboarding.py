@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from auth import get_google_sheets_client
 from database import User
-from mvp import Job
+from models import JOB_HEADERS
 
 
 async def setup_new_user_workspace(
@@ -16,10 +16,10 @@ async def setup_new_user_workspace(
 
     ws_masked = ss.sheet1
     ws_masked.update_title("Jobs Masked")
-    ws_masked.append_row(Job.HEADERS)
+    ws_masked.append_row(JOB_HEADERS)
 
-    ws_raw = ss.add_worksheet("Jobs Raw", rows=1000, cols=len(Job.HEADERS))
-    ws_raw.append_row(Job.HEADERS)
+    ws_raw = ss.add_worksheet("Jobs Raw", rows=1000, cols=len(JOB_HEADERS))
+    ws_raw.append_row(JOB_HEADERS)
 
     ws_log = ss.add_worksheet("Run Log", rows=1000, cols=7)
     ws_log.append_row(
