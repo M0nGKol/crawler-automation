@@ -253,6 +253,8 @@ def _build_output_models(
         job_id = getattr(job, "id", uuid.uuid4().hex[:10])
         scraped_at = getattr(job, "scraped_at", datetime.utcnow().isoformat())
 
+        pipeline_stage = getattr(job, "pipeline_stage", "scraped")
+
         jobs_raw.append(
             JobRaw(
                 id=job_id,
@@ -268,6 +270,7 @@ def _build_output_models(
                 contact_information=getattr(job, "contact_information", ""),
                 url=getattr(job, "url", ""),
                 scraped_at=scraped_at,
+                pipeline_stage=pipeline_stage,
             )
         )
         jobs_masked.append(
@@ -285,6 +288,7 @@ def _build_output_models(
                 contact_information=getattr(job, "contact_information", ""),
                 url=getattr(job, "url", ""),
                 scraped_at=scraped_at,
+                pipeline_stage=pipeline_stage,
             )
         )
 
@@ -297,6 +301,7 @@ async def run_pipeline(
     user_id: str | None = None,
     run_id: str | None = None,
     selected_sites: list[str] | None = None,
+    target_sheet_id: str | None = None,   # Google Sheets file ID to write to; overrides user default
 ) -> dict[str, Any]:
     start = time.monotonic()
     settings = load_settings()
@@ -498,14 +503,23 @@ async def run_pipeline(
     # Dedup (in-run + cross-run via DB)
     jobs, _removed = deduplicate_jobs(jobs)
     log.info(f"[PIPELINE] After dedup: {len(jobs)} jobs")
+    for job in jobs:
+        job.pipeline_stage = getattr(job, "pipeline_stage", "scraped") + "→deduped"
 
-    # Deadline filter
-    jobs = [job for job in jobs if is_within_deadline(job)]
+    # Deadline filter — stamp before filtering so we capture the reason on kept jobs
+    deadline_kept = []
+    for job in jobs:
+        if is_within_deadline(job):
+            has_date = bool((job.application_deadline or "").strip())
+            job.pipeline_stage += "→deadline_ok" if has_date else "→deadline_skipped(no_date)"
+            deadline_kept.append(job)
+    jobs = deadline_kept
     log.info(f"[PIPELINE] After deadline filter: {len(jobs)} jobs")
 
     # Mask sensitive fields
     jobs = mask_jobs(jobs, claude=claude, masking_limit=settings.masking_limit)
     log.info(f"[PIPELINE] After masking: {len(jobs)} jobs")
+    # Stamping for masking is done inside mask_jobs via _stamp_masking_stage()
 
     # Build output models (Task 5)
     jobs_raw, jobs_masked = _build_output_models(jobs)
@@ -514,15 +528,18 @@ async def run_pipeline(
     # Write CSV (Task 4)
     raw_csv, masked_csv = save_csv(jobs_raw, jobs_masked, str(settings.output_dir))
 
-    # Write Sheets (Task 3)
-    log.info(f"[PIPELINE] Calling write_to_sheets with user_id: {user_id}")
+    # Write Sheets
+    # target_sheet_id (Google Sheets file ID) wins if provided by the caller.
+    # Falls back to user's stored sheet, then env-configured default.
+    effective_sheet_id = target_sheet_id or settings.sheet_id
+    log.info(f"[PIPELINE] Calling write_to_sheets — sheet_id={effective_sheet_id}, user_id={user_id}")
     try:
         sheet_url = write_to_sheets(
             jobs_raw,
             jobs_masked,
-            sheet_id=settings.sheet_id,
+            sheet_id=effective_sheet_id,
             creds_path=settings.creds_path,
-            user_id=user_id,
+            user_id=user_id if not target_sheet_id else None,  # skip user lookup when sheet is explicit
         )
         log.info(f"[PIPELINE] Sheets write completed, url: {sheet_url}")
     except Exception as e:
@@ -550,6 +567,13 @@ def run_scraper(
     user_id: str | None = None,
     sites: list[str] | None = None,
     selected_sites: list[str] | None = None,
+    target_sheet_id: str | None = None,
 ) -> dict[str, Any]:
     chosen_sites = sites if sites is not None else selected_sites
-    return asyncio.run(run_pipeline(user_id=user_id, selected_sites=chosen_sites))
+    return asyncio.run(
+        run_pipeline(
+            user_id=user_id,
+            selected_sites=chosen_sites,
+            target_sheet_id=target_sheet_id,
+        )
+    )

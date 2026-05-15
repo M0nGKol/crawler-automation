@@ -8,6 +8,7 @@ import LanguageToggle from "@/components/LanguageToggle";
 
 const navItems = [
   { href: "/dashboard", icon: "◈", labelKey: "nav.dashboard" as const },
+  { href: "/dashboard/sheets", icon: "⊞", labelKey: "nav.sheets" as const },
   { href: "/config", icon: "⚙", labelKey: "nav.config" as const },
   { href: "/logs", icon: "☰", labelKey: "nav.logs" as const },
   { href: "/users", icon: "◎", labelKey: "nav.users" as const },

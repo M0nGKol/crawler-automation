@@ -12,6 +12,7 @@ const dict = {
 
   // ── Nav ──
   "nav.dashboard": { ja: "ダッシュボード", en: "Dashboard" },
+  "nav.sheets": { ja: "スプレッドシート", en: "Sheets" },
   "nav.config": { ja: "設定", en: "Settings" },
   "nav.logs": { ja: "実行ログ", en: "Run Logs" },
   "nav.users": { ja: "ユーザー", en: "Users" },

@@ -40,9 +40,9 @@ from auth import (
     verify_jwt,
     verify_password,
 )
-from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, get_db, init_db
+from database import OAuthState, RunLog, ScraperSite, SessionLocal, User, UserSheet, get_db, init_db
 from app.config import load_sites_config, merge_sites, parse_sites_yaml
-from onboarding import setup_new_user_workspace
+from onboarding import setup_new_user_workspace, create_additional_sheet
 from output.sheets_sink import ensure_sheet_schema
 from pipeline import run_scraper
 
@@ -113,7 +113,12 @@ class SyncRequest(BaseModel):
 
 class RunRequest(BaseModel):
     user_id: str | None = None
-    sites: list[str] | None = None  # List of site names to scrape; if omitted, scrape all active sites
+    sites: list[str] | None = None      # site names to scrape; None = all active
+    sheet_id: str | None = None         # UserSheet.id to write to; None = user's default
+
+
+class CreateSheetRequest(BaseModel):
+    title: str  # Human-readable name the user gives the new sheet
 
 
 class SitesPayload(BaseModel):
@@ -434,6 +439,111 @@ def auth_sheets_repair(
         raise HTTPException(status_code=500, detail=f"Sheet repair failed: {exc}") from exc
 
 
+# ── Sheet management ─────────────────────────────────────────────────────────
+
+def _format_user_sheet(us: UserSheet) -> dict[str, Any]:
+    return {
+        "id": us.id,
+        "sheet_id": us.sheet_id,
+        "sheet_title": us.sheet_title,
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{us.sheet_id}",
+        "is_default": us.is_default,
+        "created_at": us.created_at.isoformat() if us.created_at else None,
+    }
+
+
+@app.get("/sheets")
+def list_user_sheets(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return all Google Sheets belonging to the authenticated user."""
+    user = _require_user_from_jwt(authorization, db)
+    sheets = db.query(UserSheet).filter(UserSheet.user_id == user.id).order_by(UserSheet.created_at).all()
+    return {"sheets": [_format_user_sheet(s) for s in sheets]}
+
+
+@app.post("/sheets/create")
+async def create_sheet(
+    payload: CreateSheetRequest,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Create a new Google Sheet for the authenticated user."""
+    user = _require_user_from_jwt(authorization, db)
+    if not user.google_token:
+        raise HTTPException(status_code=400, detail="Google account not connected")
+
+    title = payload.title.strip() or f"Healthcare Jobs — {datetime.now().strftime('%Y-%m-%d')}"
+
+    try:
+        result = await create_additional_sheet(user=user, sheet_title=title, db=db)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create sheet: {exc}") from exc
+
+
+@app.delete("/sheets/{sheet_record_id}")
+def delete_user_sheet(
+    sheet_record_id: str,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Remove a sheet from the user's list.
+    Does NOT delete the Google Sheet itself — only removes the record.
+    Cannot delete the default sheet; set another sheet as default first.
+    """
+    user = _require_user_from_jwt(authorization, db)
+    us = db.query(UserSheet).filter(
+        UserSheet.id == sheet_record_id,
+        UserSheet.user_id == user.id,
+    ).first()
+    if not us:
+        raise HTTPException(status_code=404, detail="Sheet not found")
+    if us.is_default:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot remove the default sheet. Set another sheet as default first.",
+        )
+    db.delete(us)
+    db.commit()
+    return {"ok": True, "deleted_id": sheet_record_id}
+
+
+@app.put("/sheets/{sheet_record_id}/set-default")
+def set_default_sheet(
+    sheet_record_id: str,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Make a sheet the default target for pipeline runs.
+    Clears is_default on all other sheets for this user.
+    Also updates user.sheet_id for backward compatibility.
+    """
+    user = _require_user_from_jwt(authorization, db)
+    target = db.query(UserSheet).filter(
+        UserSheet.id == sheet_record_id,
+        UserSheet.user_id == user.id,
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Sheet not found")
+
+    # Clear existing default
+    db.query(UserSheet).filter(
+        UserSheet.user_id == user.id,
+        UserSheet.is_default == True,
+    ).update({"is_default": False})
+
+    target.is_default = True
+    user.sheet_id = target.sheet_id   # keep backward compat
+    db.commit()
+    db.refresh(target)
+
+    return _format_user_sheet(target)
+
+
 @app.post("/run")
 async def run_pipeline_endpoint(
     payload: RunRequest,
@@ -463,6 +573,24 @@ async def run_pipeline_endpoint(
     db.refresh(run_log)
     run_id = run_log.id
 
+    # Resolve which Google sheet to write to for this run.
+    # Priority: payload.sheet_id (a UserSheet.id) > user's default sheet > user.sheet_id
+    target_google_sheet_id: str | None = None
+    if user:
+        if payload.sheet_id:
+            us = db.query(UserSheet).filter(
+                UserSheet.id == payload.sheet_id,
+                UserSheet.user_id == user.id,
+            ).first()
+            if us:
+                target_google_sheet_id = us.sheet_id
+        if not target_google_sheet_id:
+            default_us = db.query(UserSheet).filter(
+                UserSheet.user_id == user.id,
+                UserSheet.is_default == True,
+            ).first()
+            target_google_sheet_id = default_us.sheet_id if default_us else user.sheet_id
+
     async def _run_in_background() -> None:
         """Execute the pipeline and update the run_log when done."""
         _db = SessionLocal()
@@ -471,6 +599,7 @@ async def run_pipeline_endpoint(
                 run_scraper,
                 user_id=user.id if user else None,
                 sites=payload.sites,
+                target_sheet_id=target_google_sheet_id,
             )
             _log = _db.query(RunLog).filter(RunLog.id == run_id).first()
             if _log:
