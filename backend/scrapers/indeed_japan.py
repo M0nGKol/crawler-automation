@@ -26,19 +26,24 @@ _ENRICHMENT_FIELDS = ("requirements", "employment_type", "application_deadline",
 
 # ── Fetch helpers ─────────────────────────────────────────────────────────────
 
-def fetch_url(url: str, use_proxy: bool = False) -> requests.Response:
-    """Fetch URL directly or via ScraperAPI."""
+def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> requests.Response:
+    """Fetch URL directly or via ScraperAPI.
+
+    render_js=True should be used for detail pages — Indeed Japan's job pages
+    are protected by Cloudflare and require JavaScript execution to serve real HTML.
+    render_js=False is fine for listing/search pages and RSS feeds.
+    """
     if use_proxy and SCRAPERAPI_KEY:
-        log.info(f"[INDEED] Using ScraperAPI for: {url}")
+        log.info(f"[INDEED] ScraperAPI (render={render_js}) for: {url}")
         return requests.get(
             "http://api.scraperapi.com",
             params={
                 "api_key": SCRAPERAPI_KEY,
                 "url": url,
                 "country_code": "jp",
-                "render": "false",  # keep render=false to save credits
+                "render": "true" if render_js else "false",
             },
-            timeout=30,
+            timeout=60,  # JS rendering needs extra time
         )
 
     log.info(f"[INDEED] Direct fetch: {url}")
@@ -47,6 +52,59 @@ def fetch_url(url: str, use_proxy: bool = False) -> requests.Response:
         headers={"User-Agent": "Mozilla/5.0 (compatible; RSS reader)"},
         timeout=30,
     )
+
+
+def _normalize_indeed_url(url: str) -> str:
+    """
+    Convert any Indeed URL variant to a canonical viewjob URL.
+
+    RSS feeds and search results return redirect URLs like:
+      https://jp.indeed.com/rc/clk?jk=ABC123&...
+    We extract the job key (jk param) and return the stable viewjob URL.
+    If no jk param is found the original URL is returned unchanged.
+    """
+    if not url:
+        return url
+    if not url.startswith("http"):
+        url = f"https://jp.indeed.com{url}"
+
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    jk = params.get("jk", [None])[0]
+    if jk:
+        return f"https://jp.indeed.com/viewjob?jk={jk}"
+    return url
+
+
+def _is_valid_job_page(html: str) -> bool:
+    """
+    Return True only if the HTML looks like a real Indeed job detail page.
+    Rejects Cloudflare challenge pages, empty responses, and error pages.
+    """
+    if not html or len(html) < 500:
+        return False
+    # Cloudflare / bot detection markers
+    if any(marker in html for marker in [
+        "challenge-platform",
+        "cf-browser-verification",
+        "Just a moment",
+        "Checking your browser",
+        "Enable JavaScript",
+        "cf_chl_",
+    ]):
+        return False
+    # Must contain at least one indicator that this is a real Indeed page
+    return any(marker in html for marker in [
+        "jobDescriptionText",
+        "jobsearch-JobComponent",
+        "viewJobSSRRoot",
+        "jobDescription",
+        "icl-u-xs",
+        "雇用形態",
+        "給与",
+        "勤務地",
+    ])
 
 
 # ── Two-pass detail enrichment ────────────────────────────────────────────────
@@ -80,15 +138,31 @@ def _enrich_job_from_detail(job: Job) -> None:
     """
     Fetch the job detail page via ScraperAPI and extract missing fields.
     Mutates the job object in-place. Skips safely if URL is empty or fetch fails.
+
+    Uses render_js=True because Indeed Japan detail pages are behind Cloudflare
+    and won't return real HTML without JavaScript execution.
+    Also normalizes the URL to the canonical viewjob?jk= form first.
     """
     if not job.url:
         return
 
+    # Normalize redirect URLs (e.g. /rc/clk?jk=...) to canonical viewjob URLs
+    canonical_url = _normalize_indeed_url(job.url)
+    if canonical_url != job.url:
+        log.info(f"[INDEED] URL normalized: {job.url} → {canonical_url}")
+        job.url = canonical_url
+
     try:
-        response = fetch_url(job.url, use_proxy=True)
+        response = fetch_url(canonical_url, use_proxy=True, render_js=True)
         if response.status_code != 200:
             log.warning(
-                f"[INDEED] Detail page returned {response.status_code} for: {job.url}"
+                f"[INDEED] Detail page returned {response.status_code} for: {canonical_url}"
+            )
+            return
+
+        if not _is_valid_job_page(response.text):
+            log.warning(
+                f"[INDEED] Detail page looks like a bot-challenge page (len={len(response.text)}): {canonical_url}"
             )
             return
 
@@ -133,44 +207,52 @@ def _extract_detail_fields(html: str) -> dict:
     }
 
     # ── Job Description ───────────────────────────────────────────────────────
-    desc_selectors = [
-        {"id": "jobDescriptionText"},
-        {"data-testid": "jobsearch-JobComponent-description"},
-        {"class": "jobsearch-jobDescriptionText"},
-        {"class": "jobsearch-JobComponent-description"},
-    ]
-    for sel in desc_selectors:
-        el = soup.find("div", sel)
-        if el:
-            result["job_description"] = el.get_text(separator="\n", strip=True)[:2000]
-            break
+    # Indeed Japan uses id="jobDescriptionText" on its SSR-rendered viewjob pages.
+    desc_el = (
+        soup.find("div", id="jobDescriptionText")
+        or soup.find("div", attrs={"data-testid": "jobsearch-JobComponent-description"})
+        or soup.find("div", class_=re.compile(r"jobDescription|jobsearch-jobDescriptionText", re.I))
+        or soup.find("div", id=re.compile(r"jobDescription", re.I))
+    )
+    if desc_el:
+        result["job_description"] = desc_el.get_text(separator="\n", strip=True)[:2000]
 
     # ── Salary ────────────────────────────────────────────────────────────────
-    salary_selectors = [
-        {"data-testid": "attribute_snippet_testid"},
-        {"class": "salary-snippet-container"},
-        {"class": "icl-u-xs-mr--xs"},
-    ]
-    for sel in salary_selectors:
-        el = soup.find(attrs=sel)
-        if el:
-            text = el.get_text(strip=True)
-            if any(c in text for c in ["円", "万", "¥"]):
-                result["salary_raw"] = text
-                break
+    # viewjob pages put salary in a metadata table or attribute_snippet span.
+    salary_candidates = (
+        soup.find_all(attrs={"data-testid": "attribute_snippet_testid"})
+        + soup.find_all("div", class_=re.compile(r"salary|wage", re.I))
+        + soup.find_all("span", class_=re.compile(r"salary|icl-u-xs", re.I))
+        + soup.find_all("div", class_=re.compile(r"icl-u-xs", re.I))
+    )
+    for el in salary_candidates:
+        text = el.get_text(strip=True)
+        if any(c in text for c in ["円", "万", "¥", "時給", "月給", "年収"]):
+            result["salary_raw"] = text[:200]
+            break
 
-    full_text = soup.get_text()
+    full_text = soup.get_text(separator="\n")
 
     # ── Employment Type ───────────────────────────────────────────────────────
-    employment_keywords = ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "嘱託"]
-    for keyword in employment_keywords:
-        if keyword in full_text:
-            match = re.search(
-                rf"(雇用形態|勤務形態)[^\n]*{keyword}|{keyword}[^\n]*(雇用|勤務|契約)",
-                full_text,
-            )
-            result["employment_type"] = match.group(0).strip()[:100] if match else keyword
-            break
+    # First try structured metadata rows (viewjob pages render these as labelled divs)
+    employment_el = soup.find(string=re.compile(r"雇用形態|勤務形態"))
+    if employment_el:
+        parent = employment_el.find_parent()
+        if parent:
+            # Sibling or parent's next sibling typically holds the value
+            sibling = parent.find_next_sibling()
+            if sibling:
+                result["employment_type"] = sibling.get_text(strip=True)[:100]
+    if not result["employment_type"]:
+        employment_keywords = ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "嘱託"]
+        for keyword in employment_keywords:
+            if keyword in full_text:
+                match = re.search(
+                    rf"(雇用形態|勤務形態)[^\n]*{keyword}|{keyword}[^\n]*(雇用|勤務|契約)",
+                    full_text,
+                )
+                result["employment_type"] = match.group(0).strip()[:100] if match else keyword
+                break
 
     # ── Application Deadline ──────────────────────────────────────────────────
     deadline_patterns = [
@@ -179,6 +261,7 @@ def _extract_detail_fields(html: str) -> dict:
         r"締切[^\n：:]*[:：]?\s*(\d{4}[年/\-]\d{1,2}[月/\-]\d{1,2})",
         r"(\d{4}年\d{1,2}月\d{1,2}日).*?まで",
         r"(\d{4}/\d{1,2}/\d{1,2}).*?締",
+        r"(\d{4}-\d{2}-\d{2}).*?締",
     ]
     for pattern in deadline_patterns:
         match = re.search(pattern, full_text)
@@ -193,7 +276,7 @@ def _extract_detail_fields(html: str) -> dict:
         r"(お問い合わせ[^\n]{0,100})",
         r"(TEL[^\n]{0,80})",
         r"(電話[^\n：:]*[:：]?\s*[\d\-（）()]+)",
-        r"([\w.+-]+@[\w-]+\.[a-z]{2,})",
+        r"([\w.+-]+@[\w\-]+\.[a-z]{2,})",
     ]
     for pattern in contact_patterns:
         match = re.search(pattern, full_text)
@@ -202,18 +285,27 @@ def _extract_detail_fields(html: str) -> dict:
             break
 
     # ── Requirements ──────────────────────────────────────────────────────────
-    req_patterns = [
-        r"応募資格([^\n]{0,500})",
-        r"必要資格([^\n]{0,500})",
-        r"応募条件([^\n]{0,500})",
-        r"資格要件([^\n]{0,500})",
-        r"必須スキル([^\n]{0,500})",
-    ]
-    for pattern in req_patterns:
-        match = re.search(pattern, full_text, re.DOTALL)
-        if match:
-            result["requirements"] = match.group(1).strip()[:500]
-            break
+    # Try structured element first, then regex on full text
+    req_el = soup.find(string=re.compile(r"応募資格|必要資格|応募条件|資格要件|必須スキル"))
+    if req_el:
+        parent = req_el.find_parent()
+        if parent:
+            block = parent.find_next_sibling() or parent.find_parent()
+            if block:
+                result["requirements"] = block.get_text(separator="\n", strip=True)[:500]
+    if not result["requirements"]:
+        req_patterns = [
+            r"応募資格\s*([^\n].{10,500}?)(?=\n\n|\Z)",
+            r"必要資格\s*([^\n].{10,500}?)(?=\n\n|\Z)",
+            r"応募条件\s*([^\n].{10,500}?)(?=\n\n|\Z)",
+            r"資格要件\s*([^\n].{10,500}?)(?=\n\n|\Z)",
+            r"必須スキル\s*([^\n].{10,500}?)(?=\n\n|\Z)",
+        ]
+        for pattern in req_patterns:
+            match = re.search(pattern, full_text, re.DOTALL)
+            if match:
+                result["requirements"] = match.group(1).strip()[:500]
+                break
 
     return result
 

@@ -196,19 +196,28 @@ def write_to_sheets(
     log.info(f"[SHEETS] Starting write - requested sheet_id: {sheet_id}, user_id: {user_id}")
     log.info(f"[SHEETS] Jobs to write - raw: {len(jobs_raw)}, masked: {len(jobs_masked)}")
     
-    effective_sheet_id = sheet_id
+    effective_sheet_id = sheet_id  # honour the explicit sheet_id first
     gc = None
 
     if user_id:
         db = SessionLocal()
         try:
             user = db.query(User).filter(User.id == user_id).first()
-            if user and user.google_token and user.sheet_id:
+            if user and user.google_token:
+                # Always load OAuth credentials from the user — this is separate
+                # from which sheet we write to.
                 gc = get_google_sheets_client(user.google_token)
-                effective_sheet_id = user.sheet_id
-                log.info(f"[SHEETS] Loaded credentials for user {user_id}. Using sheet {effective_sheet_id}")
+                if effective_sheet_id:
+                    # Caller provided an explicit sheet — use it, don't override.
+                    log.info(f"[SHEETS] Credentials loaded for user {user_id}. Using caller-supplied sheet: {effective_sheet_id}")
+                elif user.sheet_id:
+                    # No explicit sheet — fall back to the user's stored default.
+                    effective_sheet_id = user.sheet_id
+                    log.info(f"[SHEETS] Credentials loaded for user {user_id}. Falling back to user default sheet: {effective_sheet_id}")
+                else:
+                    log.warning(f"[SHEETS] User {user_id} has no sheet configured")
             else:
-                log.warning(f"[SHEETS] User {user_id} found but missing token or sheet_id")
+                log.warning(f"[SHEETS] User {user_id} found but missing Google token")
         except Exception as e:
             log.error(f"[SHEETS] Error loading user credentials: {e}")
         finally:

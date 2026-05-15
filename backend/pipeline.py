@@ -539,7 +539,7 @@ async def run_pipeline(
             jobs_masked,
             sheet_id=effective_sheet_id,
             creds_path=settings.creds_path,
-            user_id=user_id if not target_sheet_id else None,  # skip user lookup when sheet is explicit
+            user_id=user_id,  # always pass user_id for OAuth credential lookup
         )
         log.info(f"[PIPELINE] Sheets write completed, url: {sheet_url}")
     except Exception as e:
