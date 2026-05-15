@@ -19,8 +19,16 @@ SEARCH_QUERIES = [
     {"q": "薬剤師", "l": "東京"},
 ]
 
+# ── Credit-saving limits ──────────────────────────────────────────────────────
+# How many jobs to pull per RSS query. Lower = fewer detail-page requests.
+RSS_LIMIT_PER_QUERY: int = int(os.getenv("INDEED_RSS_LIMIT", "15"))
+
+# Hard cap on ScraperAPI detail-page calls per full pipeline run.
+# render=true costs 5-10× more credits; this keeps a run predictable.
+# Set INDEED_MAX_DETAIL_FETCHES=0 in env to disable enrichment entirely.
+MAX_DETAIL_FETCHES: int = int(os.getenv("INDEED_MAX_DETAIL_FETCHES", "20"))
+
 # Fields that must be populated for a job to skip the detail-page fetch.
-# If any of these are empty, a second ScraperAPI call is made to the job URL.
 _ENRICHMENT_FIELDS = ("requirements", "employment_type", "application_deadline", "job_description")
 
 
@@ -117,18 +125,30 @@ def _needs_enrichment(job: Job) -> bool:
 def _enrich_jobs(jobs: list[Job]) -> list[Job]:
     """
     Pass 2: visit each job's detail page to fill empty fields.
-    Only fetches pages for jobs that are missing at least one critical field.
-    Jobs that already have complete data are skipped to conserve API credits.
+
+    Credit-saving rules applied here:
+    1. Skip jobs that already have complete data (free).
+    2. Hard cap: at most MAX_DETAIL_FETCHES ScraperAPI calls per run.
+    3. Each call tries render=false first (1 credit); only upgrades to
+       render=true (5-10 credits) if the response fails validation.
+       In practice, Indeed Japan embeds all structured data in JSON-LD
+       which is SSR-rendered — so render=false is usually sufficient.
     """
+    if MAX_DETAIL_FETCHES == 0:
+        log.info("[INDEED] Enrichment disabled (INDEED_MAX_DETAIL_FETCHES=0)")
+        return jobs
+
     needs = [j for j in jobs if _needs_enrichment(j)]
     complete = len(jobs) - len(needs)
+    to_fetch = needs[:MAX_DETAIL_FETCHES]
+    capped = len(needs) - len(to_fetch)
 
     log.info(
-        f"[INDEED] Enrichment pass: {len(needs)} jobs need detail fetch, "
-        f"{complete} already complete — skipping"
+        f"[INDEED] Enrichment pass: {len(to_fetch)} detail fetches "
+        f"(+{complete} already complete, +{capped} skipped by cap)"
     )
 
-    for job in needs:
+    for job in to_fetch:
         _enrich_job_from_detail(job)
 
     return jobs
@@ -136,12 +156,14 @@ def _enrich_jobs(jobs: list[Job]) -> list[Job]:
 
 def _enrich_job_from_detail(job: Job) -> None:
     """
-    Fetch the job detail page via ScraperAPI and extract missing fields.
-    Mutates the job object in-place. Skips safely if URL is empty or fetch fails.
+    Fetch the job detail page and extract missing fields. Mutates in-place.
 
-    Uses render_js=True because Indeed Japan detail pages are behind Cloudflare
-    and won't return real HTML without JavaScript execution.
-    Also normalizes the URL to the canonical viewjob?jk= form first.
+    Credit strategy (cheapest-first):
+    1. Try render=false (1 credit) — JSON-LD structured data is SSR-rendered
+       on Indeed Japan viewjob pages and doesn't need JavaScript.
+    2. If the page fails the validity check (Cloudflare challenge), upgrade to
+       render=true (5-10 credits) as a last resort.
+    3. If both fail, log a warning and leave the fields empty.
     """
     if not job.url:
         return
@@ -152,51 +174,58 @@ def _enrich_job_from_detail(job: Job) -> None:
         log.info(f"[INDEED] URL normalized: {job.url} → {canonical_url}")
         job.url = canonical_url
 
+    html: str = ""
     try:
-        response = fetch_url(canonical_url, use_proxy=True, render_js=True)
-        if response.status_code != 200:
-            log.warning(
-                f"[INDEED] Detail page returned {response.status_code} for: {canonical_url}"
-            )
-            return
-
-        if not _is_valid_job_page(response.text):
-            log.warning(
-                f"[INDEED] Detail page looks like a bot-challenge page (len={len(response.text)}): {canonical_url}"
-            )
-            return
-
-        extracted = _extract_detail_fields(response.text)
-
-        # Only overwrite fields that are currently empty on the job object
-        if not job.job_description and extracted.get("job_description"):
-            job.job_description = extracted["job_description"]
-        if not job.requirements and extracted.get("requirements"):
-            job.requirements = extracted["requirements"]
-        if not job.employment_type and extracted.get("employment_type"):
-            job.employment_type = extracted["employment_type"]
-        if not job.application_deadline and extracted.get("application_deadline"):
-            job.application_deadline = extracted["application_deadline"]
-        if not job.contact_information and extracted.get("contact_information"):
-            job.contact_information = extracted["contact_information"]
-        if not job.salary_raw and extracted.get("salary_raw"):
-            job.salary_raw = extracted["salary_raw"]
-
-        log.info(f"[INDEED] Enriched: {job.job_title[:40]!r}")
-
+        # ── Attempt 1: render=false (cheap, 1 credit) ───────────────────────
+        resp = fetch_url(canonical_url, use_proxy=True, render_js=False)
+        if resp.status_code == 200 and _is_valid_job_page(resp.text):
+            html = resp.text
+            log.info(f"[INDEED] Detail OK with render=false (cheap): {canonical_url}")
+        else:
+            # ── Attempt 2: render=true (expensive, 5-10 credits) ────────────
+            log.info(f"[INDEED] render=false invalid ({resp.status_code}), upgrading to render=true: {canonical_url}")
+            resp2 = fetch_url(canonical_url, use_proxy=True, render_js=True)
+            if resp2.status_code == 200 and _is_valid_job_page(resp2.text):
+                html = resp2.text
+                log.info(f"[INDEED] Detail OK with render=true: {canonical_url}")
+            else:
+                log.warning(f"[INDEED] Both render attempts failed for: {canonical_url}")
+                return
     except Exception as e:
-        log.warning(f"[INDEED] Detail enrichment failed for {job.url}: {e}")
+        log.warning(f"[INDEED] Detail fetch failed for {canonical_url}: {e}")
+        return
+
+    extracted = _extract_detail_fields(html)
+
+    # Only overwrite fields that are currently empty on the job object
+    if not job.job_description and extracted.get("job_description"):
+        job.job_description = extracted["job_description"]
+    if not job.requirements and extracted.get("requirements"):
+        job.requirements = extracted["requirements"]
+    if not job.employment_type and extracted.get("employment_type"):
+        job.employment_type = extracted["employment_type"]
+    if not job.application_deadline and extracted.get("application_deadline"):
+        job.application_deadline = extracted["application_deadline"]
+    if not job.contact_information and extracted.get("contact_information"):
+        job.contact_information = extracted["contact_information"]
+    if not job.salary_raw and extracted.get("salary_raw"):
+        job.salary_raw = extracted["salary_raw"]
+
+    filled = [f for f in _ENRICHMENT_FIELDS if getattr(job, f, "")]
+    log.info(f"[INDEED] Enriched {job.job_title[:40]!r} — filled: {filled}")
 
 
-def _extract_detail_fields(html: str) -> dict:
+def _extract_from_json_ld(soup) -> dict:
     """
-    Parse an Indeed Japan job detail page and extract all structured fields.
-    Uses multiple CSS selector fallbacks per field to survive DOM changes.
-    Returns a dict — missing fields are empty strings.
-    """
-    from bs4 import BeautifulSoup
+    Extract job fields from JSON-LD structured data embedded in the page.
 
-    soup = BeautifulSoup(html, "html.parser")
+    Indeed Japan injects a <script type="application/ld+json"> block containing
+    a JobPosting schema on every viewjob page for SEO purposes. This is
+    server-side rendered so it's available even with render=false (no JS needed).
+    This is the cheapest extraction path — 1 credit vs 5-10 for render=true.
+    """
+    import json
+
     result: dict = {
         "job_description": "",
         "requirements": "",
@@ -205,6 +234,97 @@ def _extract_detail_fields(html: str) -> dict:
         "contact_information": "",
         "salary_raw": "",
     }
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Handle both a single object and an array
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if item.get("@type") not in ("JobPosting", "jobPosting"):
+                continue
+
+            # Description
+            if item.get("description") and not result["job_description"]:
+                desc = re.sub(r"<[^>]+>", " ", str(item["description"]))
+                result["job_description"] = desc.strip()[:2000]
+
+            # Employment type (may be English like "FULL_TIME" — translate)
+            _ET_MAP = {
+                "FULL_TIME": "正社員", "PART_TIME": "パート・アルバイト",
+                "CONTRACTOR": "契約社員", "TEMPORARY": "派遣社員",
+                "INTERN": "インターン", "OTHER": "その他",
+            }
+            et = item.get("employmentType", "")
+            if et and not result["employment_type"]:
+                result["employment_type"] = _ET_MAP.get(et.upper(), et)
+
+            # Application deadline
+            if item.get("validThrough") and not result["application_deadline"]:
+                result["application_deadline"] = str(item["validThrough"])[:20]
+
+            # Salary
+            base = item.get("baseSalary", {})
+            if base and not result["salary_raw"]:
+                val = base.get("value", {})
+                if isinstance(val, dict):
+                    mn = val.get("minValue", "")
+                    mx = val.get("maxValue", "")
+                    unit_map = {"HOUR": "時給", "DAY": "日給", "WEEK": "週給", "MONTH": "月給", "YEAR": "年収"}
+                    unit = unit_map.get(str(val.get("unitText", "")).upper(), "")
+                    currency = base.get("currency", "JPY")
+                    if mn and mx:
+                        result["salary_raw"] = f"{unit}{mn}〜{mx}{currency}"
+                    elif mn or mx:
+                        result["salary_raw"] = f"{unit}{mn or mx}{currency}"
+                elif val:
+                    result["salary_raw"] = str(val)
+
+            # Hiring org contact
+            org = item.get("hiringOrganization", {})
+            if isinstance(org, dict) and not result["contact_information"]:
+                contact_parts = [p for p in [
+                    org.get("name", ""),
+                    org.get("telephone", ""),
+                    org.get("email", ""),
+                ] if p]
+                if contact_parts:
+                    result["contact_information"] = " / ".join(contact_parts)[:200]
+
+            log.debug(f"[INDEED] JSON-LD extracted: {list(k for k,v in result.items() if v)}")
+            return result  # found a JobPosting — done
+
+    return result  # no JSON-LD found or no matching @type
+
+
+def _extract_detail_fields(html: str) -> dict:
+    """
+    Parse an Indeed Japan job detail page and extract all structured fields.
+
+    Strategy (cheapest-first):
+    1. JSON-LD structured data  — SSR, works with render=false, zero extra cost
+    2. CSS selector fallbacks   — SSR div elements
+    3. Full-text regex          — last resort
+
+    Returns a dict — missing fields are empty strings.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # ── Strategy 1: JSON-LD (cheapest, most reliable) ────────────────────────
+    result = _extract_from_json_ld(soup)
+
+    # If JSON-LD gave us everything we need, return immediately
+    if all(result.get(f) for f in ("job_description", "employment_type")):
+        log.info("[INDEED] Extraction complete via JSON-LD (no CSS/regex needed)")
+        return result
+
+    # ── Strategy 2 & 3: CSS + regex fallback for still-empty fields ──────────
+    # (only runs when JSON-LD was missing or incomplete)
 
     # ── Job Description ───────────────────────────────────────────────────────
     # Indeed Japan uses id="jobDescriptionText" on its SSR-rendered viewjob pages.
@@ -347,7 +467,7 @@ def scrape_indeed_rss(query: str, location: str) -> list[Job]:
     On block, fall back to ScraperAPI HTML scrape.
     Pass 2: Enrich each job with detail-page fetch for missing fields.
     """
-    rss_url = f"https://jp.indeed.com/rss?q={query}&l={location}&limit=50"
+    rss_url = f"https://jp.indeed.com/rss?q={query}&l={location}&limit={RSS_LIMIT_PER_QUERY}"
 
     try:
         response = fetch_url(rss_url, use_proxy=False)
@@ -372,8 +492,21 @@ def scrape_indeed_rss(query: str, location: str) -> list[Job]:
     return []
 
 
+def _extract_rss_employment_type(desc_html: str) -> str:
+    """Try to find an employment type keyword in an RSS description blob."""
+    text = re.sub(r"<[^>]+>", " ", desc_html)
+    for keyword in ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "嘱託"]:
+        if keyword in text:
+            return keyword
+    return ""
+
+
 def parse_rss(xml_text: str, query: str, location: str) -> list[dict]:
-    """Parse Indeed RSS feed into standard job schema."""
+    """Parse Indeed RSS feed into standard job schema.
+
+    Extracts as many fields as possible from the description HTML to reduce
+    the number of jobs that need an expensive detail-page fetch in Pass 2.
+    """
     jobs: list[dict] = []
     try:
         root = ET.fromstring(xml_text)
@@ -385,6 +518,9 @@ def parse_rss(xml_text: str, query: str, location: str) -> list[dict]:
             if not title or not link:
                 continue
 
+            desc_html = description.text if description is not None else ""
+            desc_text = strip_html(desc_html)
+
             job_id = hashlib.md5(f"indeed_japan|{title.text}|{location}".encode()).hexdigest()
 
             jobs.append(
@@ -395,17 +531,16 @@ def parse_rss(xml_text: str, query: str, location: str) -> list[dict]:
                     "masked_facility": "",
                     "job_title": clean_title(title.text or ""),
                     "location": location,
-                    # RSS gives only a brief HTML description blob —
-                    # the detail fetch in _enrich_jobs will expand this
-                    "job_description": strip_html(
-                        description.text if description is not None else ""
-                    ),
+                    # RSS description is a short snippet — enrich_jobs will
+                    # expand this only if it's still below threshold
+                    "job_description": desc_text[:500],
                     "requirements": "",
-                    "salary_raw": extract_salary(
-                        description.text if description is not None else ""
-                    ),
+                    # Pull salary and employment_type from the RSS blob so
+                    # these jobs can skip the detail fetch if that's all
+                    # they're missing (saves ScraperAPI credits)
+                    "salary_raw": extract_salary(desc_html),
                     "salary_masked": "",
-                    "employment_type": "",
+                    "employment_type": _extract_rss_employment_type(desc_html),
                     "application_deadline": "",
                     "contact_information": "",
                     "url": link.text or "",
