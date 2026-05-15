@@ -2,8 +2,9 @@
 Google Sheets output sink.
 
 Writes raw job data to the 'Jobs Raw' tab and masked data to the
-'Jobs Masked' tab. Both tabs share the same 13-column schema so
-rows can be cross-referenced by the shared job id.
+'Jobs Masked' tab. Both tabs use their own header list (RAW_JOB_HEADERS /
+MASKED_JOB_HEADERS) and include a pipeline_stage column so readers can
+see exactly which processing steps each row passed through.
 """
 from __future__ import annotations
 
@@ -87,44 +88,47 @@ def _migrate_legacy_rows(
     tab_name: str,
 ) -> list[list[str]]:
     """
-    Convert old 15-column rows into the canonical 13-column schema.
-    Also accepts already-canonical rows and normalizes/pads their length.
+    Normalise any legacy row format into the current 12-column user-facing schema.
+    scraped_at and pipeline_stage are stripped — they are internal only.
+
+    Handles:
+      - Old 15-column schema (raw_facility + masked_facility + salary_raw + salary_masked)
+      - Previous 13/14-column schemas (generic facility/salary names, had scraped_at)
     """
     migrated: list[list[str]] = []
     is_raw_tab = tab_name == RAW_TAB_NAME
+    target_len = len(RAW_JOB_HEADERS)  # 12 — same for both tabs
 
     for row in rows:
         if not row or not any(cell.strip() for cell in row):
             continue
 
         if len(row) >= len(LEGACY_HEADERS):
-            padded = row + [""] * (len(LEGACY_HEADERS) - len(row))
+            # Old 15-column schema: had both raw_facility(2) + masked_facility(3)
+            # and salary_raw(8) + salary_masked(9)
+            padded = row + [""] * max(0, len(LEGACY_HEADERS) - len(row))
             facility = padded[2] if is_raw_tab else padded[3]
             salary = padded[8] if is_raw_tab else padded[9]
-            migrated.append(
-                [
-                    padded[0],   # id
-                    padded[1],   # source
-                    facility,    # facility (raw or masked by tab)
-                    padded[4],   # job_title
-                    padded[5],   # location
-                    padded[6],   # job_description
-                    padded[7],   # requirements
-                    salary,      # salary (raw or masked by tab)
-                    padded[10],  # employment_type
-                    padded[11],  # application_deadline
-                    padded[12],  # contact_information
-                    padded[13],  # url
-                    padded[14],  # scraped_at
-                ]
-            )
+            migrated.append([
+                padded[0],   # id
+                padded[1],   # source
+                facility,    # raw_facility or masked_facility
+                padded[4],   # job_title
+                padded[5],   # location
+                padded[6],   # job_description
+                padded[7],   # requirements
+                salary,      # salary_raw or salary_masked
+                padded[10],  # employment_type
+                padded[11],  # application_deadline
+                padded[12],  # contact_information
+                padded[13],  # url
+                # scraped_at (padded[14]) and pipeline_stage dropped intentionally
+            ])
             continue
 
-        if len(row) >= len(JOB_HEADERS):
-            migrated.append(row[: len(JOB_HEADERS)])
-            continue
-
-        migrated.append(row + [""] * (len(JOB_HEADERS) - len(row)))
+        # 13- or 14-column canonical row — trim to 12 (drops scraped_at / pipeline_stage)
+        padded = row + [""] * max(0, target_len - len(row))
+        migrated.append(padded[:target_len])
 
     return migrated
 
@@ -135,8 +139,9 @@ def _normalize_tab_schema(
     tab_name: str,
 ) -> None:
     """
-    Ensure worksheet headers are canonical JOB_HEADERS.
-    If a legacy 15-column schema exists, migrate old rows in place.
+    Ensure the worksheet uses the current canonical header (RAW_JOB_HEADERS or
+    MASKED_JOB_HEADERS, both 14 columns including pipeline_stage).
+    Migrates legacy schemas in-place without data loss.
     """
     target_headers = RAW_JOB_HEADERS if tab_name == RAW_TAB_NAME else MASKED_JOB_HEADERS
 
@@ -159,10 +164,13 @@ def _normalize_tab_schema(
         return
 
     if existing_header == JOB_HEADERS:
-        # Previous canonical header used generic field names (facility/salary).
-        # Data order is already correct; only rename headers per-tab.
-        ws.update("A1", [target_headers], value_input_option="USER_ENTERED")
-        log.info("[SHEETS] Updated generic header names for %s", tab_name)
+        # Previous 13-column generic header (facility/salary, no pipeline_stage).
+        # Migrate rows to add the pipeline_stage column, then update header.
+        migrated_rows = _migrate_legacy_rows(data_rows, tab_name=tab_name)
+        ws.clear()
+        payload = [target_headers, *migrated_rows] if migrated_rows else [target_headers]
+        ws.update("A1", payload, value_input_option="USER_ENTERED")
+        log.info("[SHEETS] Migrated 13-col schema → 14-col for %s (%d rows)", tab_name, len(migrated_rows))
         return
 
     # Unknown/mixed header: preserve row values, but enforce the canonical header.

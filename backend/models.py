@@ -1,15 +1,20 @@
 """
 Output-only dataclasses for raw and masked job data.
 
-Both share the same 13-field schema so they can be written to
-Google Sheets / CSV with identical column headers while keeping
-raw vs. masked data strictly separated.
+Both share the same schema so they can be written to Google Sheets / CSV
+with correct column headers while keeping raw vs. masked data strictly
+separated.
+
+Note: scraped_at and pipeline_stage are kept as dataclass fields so the
+pipeline can still access them internally, but they are NOT included in
+to_row() / header lists — they are not shown to end users in sheets or CSV.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-# Canonical column order used in every output sink
+# Generic column order — kept for backward-compat with any legacy callers.
+# New code should use RAW_JOB_HEADERS / MASKED_JOB_HEADERS instead.
 JOB_HEADERS = [
     "id",
     "source",
@@ -23,12 +28,11 @@ JOB_HEADERS = [
     "application_deadline",
     "contact_information",
     "url",
-    "scraped_at",
 ]
 
-# Explicit per-tab headers for Google Sheets.
-# Same field count/order as JOB_HEADERS, but tab-specific column names
-# to avoid ambiguity between raw and masked exports.
+# Explicit per-tab headers for Google Sheets / CSV.
+# Uses tab-specific names so raw vs. masked columns are unambiguous.
+# scraped_at and pipeline_stage are intentionally excluded — internal use only.
 RAW_JOB_HEADERS = [
     "id",
     "source",
@@ -42,7 +46,6 @@ RAW_JOB_HEADERS = [
     "application_deadline",
     "contact_information",
     "url",
-    "scraped_at",
 ]
 
 MASKED_JOB_HEADERS = [
@@ -58,7 +61,6 @@ MASKED_JOB_HEADERS = [
     "application_deadline",
     "contact_information",
     "url",
-    "scraped_at",
 ]
 
 
@@ -78,9 +80,12 @@ class JobRaw:
     application_deadline: str = ""
     contact_information: str = ""
     url: str = ""
+    # Internal fields — not written to sheets/CSV output
     scraped_at: str = ""
+    pipeline_stage: str = ""
 
     def to_row(self) -> list[str]:
+        """Returns only the user-facing columns (excludes scraped_at, pipeline_stage)."""
         return [
             self.id,
             self.source,
@@ -94,7 +99,6 @@ class JobRaw:
             self.application_deadline,
             self.contact_information,
             self.url,
-            self.scraped_at,
         ]
 
 
@@ -114,9 +118,12 @@ class JobMasked:
     application_deadline: str = ""
     contact_information: str = ""
     url: str = ""
+    # Internal fields — not written to sheets/CSV output
     scraped_at: str = ""
+    pipeline_stage: str = ""
 
     def to_row(self) -> list[str]:
+        """Returns only the user-facing columns (excludes scraped_at, pipeline_stage)."""
         return [
             self.id,
             self.source,
@@ -130,5 +137,4 @@ class JobMasked:
             self.application_deadline,
             self.contact_information,
             self.url,
-            self.scraped_at,
         ]

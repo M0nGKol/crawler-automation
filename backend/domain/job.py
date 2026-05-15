@@ -21,6 +21,7 @@ class Job:
         "contact_information",
         "url",
         "scraped_at",
+        "pipeline_stage",
     ]
 
     def __init__(self, source: str, mode: str, **kw: str) -> None:
@@ -40,6 +41,9 @@ class Job:
         self.contact_information = kw.get("contact_information", "")
         self.url = kw.get("url", "")
         self.scraped_at = datetime.now().isoformat(timespec="seconds")
+        # Tracks which pipeline processing steps this job has passed through.
+        # Each step appends a label, e.g. "scraped→deduped→deadline_ok→claude_masked"
+        self.pipeline_stage: str = "scraped"
 
     def to_row(self) -> list[str]:
         return [
@@ -58,4 +62,5 @@ class Job:
             self.contact_information,
             self.url,
             self.scraped_at,
+            self.pipeline_stage,
         ]

@@ -168,11 +168,15 @@ export async function addCustomSite(token: string, siteName: string, url: string
 export async function startRun(
   token?: string,
   sites?: string[],
+  sheetId?: string,         // UserSheet.id — which sheet to write to for this run
 ): Promise<{ run_id: string; status: string }> {
+  const body: Record<string, unknown> = {};
+  if (sites?.length) body.sites = sites;
+  if (sheetId) body.sheet_id = sheetId;
   const res = await apiFetch("/run", {
     method: "POST",
     headers: { ...authHeader(token) },
-    body: JSON.stringify(sites?.length ? { sites } : {}),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error("Failed to trigger run");
   return res.json() as Promise<{ run_id: string; status: string }>;
@@ -182,4 +186,60 @@ export async function getRun(runId: string): Promise<RunStatus> {
   const res = await apiFetch(`/run/${runId}`, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch run status");
   return res.json() as Promise<RunStatus>;
+}
+
+// ── Sheet management ────────────────────────────────────────────────────────
+
+export type UserSheet = {
+  id: string;               // UserSheet record ID (not the Google Sheet ID)
+  sheet_id: string;         // Google Sheets file ID
+  sheet_title: string;
+  sheet_url: string;
+  is_default: boolean;
+  created_at: string | null;
+};
+
+export async function getSheets(token: string): Promise<{ sheets: UserSheet[] }> {
+  const res = await apiFetch("/sheets", {
+    headers: { ...authHeader(token) },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("Failed to fetch sheets");
+  return res.json() as Promise<{ sheets: UserSheet[] }>;
+}
+
+export async function createSheet(token: string, title: string): Promise<UserSheet> {
+  const res = await apiFetch("/sheets/create", {
+    method: "POST",
+    headers: { ...authHeader(token) },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({})) as Record<string, string>;
+    throw new Error(err.detail ?? "Failed to create sheet");
+  }
+  return res.json() as Promise<UserSheet>;
+}
+
+export async function deleteSheet(token: string, sheetRecordId: string): Promise<void> {
+  const res = await apiFetch(`/sheets/${sheetRecordId}`, {
+    method: "DELETE",
+    headers: { ...authHeader(token) },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({})) as Record<string, string>;
+    throw new Error(err.detail ?? "Failed to remove sheet");
+  }
+}
+
+export async function setDefaultSheet(token: string, sheetRecordId: string): Promise<UserSheet> {
+  const res = await apiFetch(`/sheets/${sheetRecordId}/set-default`, {
+    method: "PUT",
+    headers: { ...authHeader(token) },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({})) as Record<string, string>;
+    throw new Error(err.detail ?? "Failed to set default sheet");
+  }
+  return res.json() as Promise<UserSheet>;
 }

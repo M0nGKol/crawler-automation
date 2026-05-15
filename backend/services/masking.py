@@ -55,6 +55,7 @@ def mask_jobs(jobs: list[Job], claude: Any, masking_limit: int) -> list[Job]:
         for job in jobs:
             job.masked_facility = _simple_mask(job.raw_facility)
             job.salary_masked = _simple_salary_mask(job.salary_raw)
+            job.pipeline_stage = getattr(job, "pipeline_stage", "scraped") + "→rule_masked"
         return jobs
 
     log.info("━━ Masking %d listings via Claude …", len(to_mask))
@@ -91,6 +92,7 @@ Return ONLY a JSON array. No markdown. No explanation.""",
                 masked = mask_map.get(job.id, {})
                 job.masked_facility = masked.get("masked_facility", _simple_mask(job.raw_facility))
                 job.salary_masked = masked.get("salary_masked", "")
+                job.pipeline_stage = getattr(job, "pipeline_stage", "scraped") + "→claude_masked"
 
             log.info("  Batch %d–%d masked ✓", i + 1, i + len(batch))
         except Exception as exc:
@@ -98,9 +100,11 @@ Return ONLY a JSON array. No markdown. No explanation.""",
             for job in batch:
                 job.masked_facility = _simple_mask(job.raw_facility)
                 job.salary_masked = _simple_salary_mask(job.salary_raw)
+                job.pipeline_stage = getattr(job, "pipeline_stage", "scraped") + "→rule_masked"
 
     for job in rest:
         job.masked_facility = _simple_mask(job.raw_facility)
         job.salary_masked = _simple_salary_mask(job.salary_raw)
+        job.pipeline_stage = getattr(job, "pipeline_stage", "scraped") + "→rule_masked(limit)"
 
     return jobs
