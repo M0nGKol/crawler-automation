@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from domain.job import Job
 from scraping.strategies.claude_fallback_scraper import scrape_claude_fallback
+from scraping.strategies.detail_enricher import enrich_jobs_with_detail_pages
 from scraping.strategies.json_api_scraper import fetch_json_api
 
 log = logging.getLogger(__name__)
@@ -189,7 +190,12 @@ def _scrape_jobmedley_html(html: str, site_name: str, url: str) -> list[Job]:
     return jobs
 
 
-async def scrape_site(site_name: str, config: dict[str, Any], claude: Any) -> dict[str, Any]:
+async def scrape_site(
+    site_name: str,
+    config: dict[str, Any],
+    claude: Any,
+    should_stop: "callable | None" = None,
+) -> dict[str, Any]:
     fetch_method = "html"
 
     # Special handling for Job Medley — skip JSON API, use BeautifulSoup instead
@@ -206,6 +212,11 @@ async def scrape_site(site_name: str, config: dict[str, Any], claude: Any) -> di
             fetch_method = "beautifulsoup_fallback_claude"
         else:
             fetch_method = "beautifulsoup"
+
+        # Pass 2: visit each listing's detail page to fill missing fields
+        # (description, requirements, deadline, contact, full salary).
+        if jobs:
+            jobs = await enrich_jobs_with_detail_pages(jobs, site_name, claude, should_stop=should_stop)
 
         log.info(
             "  ✓ %d listings collected from %s (status=%s, method=%s, bytes=%d)",
@@ -265,6 +276,13 @@ async def scrape_site(site_name: str, config: dict[str, Any], claude: Any) -> di
         raise ValueError(f"Empty HTML response (status={fetch_result['status']})")
 
     jobs = await scrape_claude_fallback(html, site_name, config, claude)
+
+    # Pass 2: visit each listing's detail page to fill missing fields.
+    # This is what gives you the "full information from the page you view"
+    # rather than just the listing card snippet.
+    if jobs:
+        jobs = await enrich_jobs_with_detail_pages(jobs, site_name, claude, should_stop=should_stop)
+
     log.info(
         "  ✓ %d listings collected from %s (status=%s, bytes=%d)",
         len(jobs),
@@ -287,15 +305,32 @@ async def scrape_with_retry(
     claude: Any,
     max_retries: int = MAX_RETRIES,
     backoff: int = RETRY_BACKOFF_SECONDS,
+    should_stop: "callable | None" = None,
 ) -> dict[str, Any]:
+    """Run scrape_site with retry policy.
+
+    Retry only on TRANSIENT failures (timeout, exception). If the fetch succeeded
+    but parsing yielded 0 jobs (status="no_jobs"), that's a STRUCTURAL failure —
+    retrying with the same fetcher will deterministically fail the same way and
+    just burns ScraperAPI credits / Claude API calls. Return immediately in that
+    case so we don't waste 2× extra attempts per site.
+    """
     last_error = ""
     timeout_seconds = _site_timeout(config)
     started_at = time.monotonic()
 
     for attempt in range(1, max_retries + 1):
+        if should_stop and should_stop():
+            log.info("%s stopped by user before attempt %d", site_name, attempt)
+            return _site_result(
+                site_name, "stopped", [],
+                error="stopped by user",
+                attempts=attempt - 1,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
         try:
             result = await asyncio.wait_for(
-                scrape_site(site_name, config, claude),
+                scrape_site(site_name, config, claude, should_stop=should_stop),
                 timeout=timeout_seconds,
             )
             result["attempts"] = attempt
@@ -303,6 +338,16 @@ async def scrape_with_retry(
             if result.get("jobs"):
                 return result
             if result.get("status") == "skipped":
+                return result
+            # Structural failure: fetch succeeded but parser/Claude found nothing.
+            # Retrying won't help — the page just doesn't render jobs server-side
+            # (likely a JS-only SPA or layout change). Don't burn more credits.
+            if result.get("status") == "no_jobs":
+                log.warning(
+                    "%s: 0 jobs after fetch succeeded — not retrying (structural failure, would waste credits)",
+                    site_name,
+                )
+                result["error"] = "no_jobs (no retry — structural)"
                 return result
             last_error = "no jobs found"
             log.warning("%s attempt %d: no jobs found, retrying...", site_name, attempt)
@@ -332,6 +377,7 @@ async def scrape_all(
     sites_config: dict[str, Any],
     sites_filter: str,
     claude: Any,
+    should_stop: "callable | None" = None,
 ) -> tuple[list[Job], list[dict[str, Any]]]:
     filter_list = None if sites_filter.strip().lower() == "all" else [s.strip() for s in sites_filter.split(",")]
     all_jobs: list[Job] = []
@@ -341,9 +387,15 @@ async def scrape_all(
         if filter_list and site_name not in filter_list:
             continue
 
+        # Cooperative cancellation: check before starting each site
+        if should_stop and should_stop():
+            log.info("Pipeline stopped by user — skipping remaining sites starting at %s", site_name)
+            site_results.append(_site_result(site_name, "stopped", [], error="stopped by user"))
+            continue
+
         log.info("━━ Scraping: %s (%s)", site_name, config.get("mode", "?"))
         try:
-            result = await scrape_with_retry(site_name, config, claude)
+            result = await scrape_with_retry(site_name, config, claude, should_stop=should_stop)
         except Exception as exc:
             log.error("%s failed: %s", site_name, exc)
             result = _site_result(site_name, "failed", [], error=str(exc))

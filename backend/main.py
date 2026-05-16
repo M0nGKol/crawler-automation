@@ -50,6 +50,29 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 INTERNAL_ADMIN_KEY = os.getenv("INTERNAL_ADMIN_KEY", "")
 log = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Cooperative stop registry
+#
+# Maps run_id → True if the user has requested cancellation. The pipeline
+# checks this between sites and between expensive ScraperAPI calls, so a stop
+# click takes effect within ~5-10s rather than instantly. Force-killing a
+# running fetch could corrupt the RunLog row, so cooperative is the right
+# trade-off here.
+#
+# This is per-process in-memory. If the API is horizontally scaled, this won't
+# survive a process restart and won't propagate across replicas — that's fine
+# for a single-instance Render deployment, but worth upgrading to a Redis
+# flag if you ever scale out.
+# ─────────────────────────────────────────────────────────────────────────────
+STOP_FLAGS: dict[str, bool] = {}
+
+
+def _make_stop_checker(run_id: str):
+    """Return a no-arg callable the pipeline can poll to know if it should stop."""
+    def _check() -> bool:
+        return STOP_FLAGS.get(run_id, False)
+    return _check
+
 
 def _require_internal_key(x_internal_key: str | None = Header(default=None)) -> None:
     """Guard for legacy email/password endpoints — only accessible with a server-side key."""
@@ -591,6 +614,10 @@ async def run_pipeline_endpoint(
             ).first()
             target_google_sheet_id = default_us.sheet_id if default_us else user.sheet_id
 
+    # Register this run in the stop registry so /run/{id}/stop can signal it.
+    STOP_FLAGS[run_id] = False
+    stop_checker = _make_stop_checker(run_id)
+
     async def _run_in_background() -> None:
         """Execute the pipeline and update the run_log when done."""
         _db = SessionLocal()
@@ -600,11 +627,14 @@ async def run_pipeline_endpoint(
                 user_id=user.id if user else None,
                 sites=payload.sites,
                 target_sheet_id=target_google_sheet_id,
+                should_stop=stop_checker,
             )
             _log = _db.query(RunLog).filter(RunLog.id == run_id).first()
             if _log:
                 _log.finished_at = datetime.now(timezone.utc)
-                _log.status = "completed"
+                # If the user clicked Stop, record that — distinct from "failed"
+                # so the dashboard can show a meaningful status.
+                _log.status = "stopped" if STOP_FLAGS.get(run_id) else "completed"
                 _log.sites_attempted = result.get("sites_attempted", 0)
                 _log.sites_succeeded = result.get("sites_succeeded", 0)
                 _log.sites_failed = result.get("sites_failed", 0)
@@ -621,10 +651,54 @@ async def run_pipeline_endpoint(
                 _log.errors = str(exc)
                 _db.commit()
         finally:
+            # Always clean up the flag — leaving stale flags would slowly leak memory.
+            STOP_FLAGS.pop(run_id, None)
             _db.close()
 
     background_tasks.add_task(_run_in_background)
     return {"run_id": run_id, "status": "started"}
+
+
+@app.post("/run/{run_id}/stop")
+def stop_pipeline_endpoint(
+    run_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Signal a running pipeline to stop cooperatively.
+
+    The pipeline checks the flag between sites and between expensive fetches.
+    A stop click takes effect within ~5-10 seconds, not instantly — any
+    currently in-flight HTTP request will finish before the loop exits.
+    """
+    row = db.query(RunLog).filter(RunLog.id == run_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Already finished — nothing to stop, just report the current state.
+    if row.finished_at is not None:
+        return {
+            "run_id": run_id,
+            "status": getattr(row, "status", "unknown"),
+            "stopped": False,
+            "message": "Run already finished",
+        }
+
+    # Not registered in this process — likely a different worker handled it,
+    # or the server restarted. Tell the client we can't reach this run.
+    if run_id not in STOP_FLAGS:
+        raise HTTPException(
+            status_code=409,
+            detail="Run is not tracked by this process (server may have restarted)",
+        )
+
+    STOP_FLAGS[run_id] = True
+    log.info("[STOP] User requested stop for run %s", run_id)
+    return {
+        "run_id": run_id,
+        "status": "stopping",
+        "stopped": True,
+        "message": "Stop signal sent — pipeline will halt after current fetch completes",
+    }
 
 
 @app.get("/run/{run_id}")

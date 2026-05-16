@@ -188,6 +188,25 @@ export async function getRun(runId: string): Promise<RunStatus> {
   return res.json() as Promise<RunStatus>;
 }
 
+export type StopRunResponse = {
+  run_id: string;
+  status: string;
+  stopped: boolean;
+  message: string;
+};
+
+export async function stopRun(runId: string, token?: string): Promise<StopRunResponse> {
+  const res = await apiFetch(`/run/${runId}/stop`, {
+    method: "POST",
+    headers: { ...authHeader(token) },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({})) as Record<string, string>;
+    throw new Error(err.detail ?? "Failed to stop run");
+  }
+  return res.json() as Promise<StopRunResponse>;
+}
+
 // ── Sheet management ────────────────────────────────────────────────────────
 
 export type UserSheet = {

@@ -302,6 +302,7 @@ async def run_pipeline(
     run_id: str | None = None,
     selected_sites: list[str] | None = None,
     target_sheet_id: str | None = None,   # Google Sheets file ID to write to; overrides user default
+    should_stop: "callable | None" = None,  # cooperative cancellation hook
 ) -> dict[str, Any]:
     start = time.monotonic()
     settings = load_settings()
@@ -402,7 +403,9 @@ async def run_pipeline(
     scrape_results: list[dict[str, Any]] = []
 
     if other_sites:
-        jobs_other, scrape_results_other = await scrape_all(other_sites, settings.sites_filter, claude)
+        jobs_other, scrape_results_other = await scrape_all(
+            other_sites, settings.sites_filter, claude, should_stop=should_stop
+        )
         jobs.extend(jobs_other)
         scrape_results.extend(scrape_results_other)
 
@@ -414,10 +417,22 @@ async def run_pipeline(
         for site_name, cfg in indeed_sites.items():
             if filter_list and site_name not in filter_list:
                 continue
+            # Cooperative cancellation between sites in the Indeed loop too.
+            if should_stop and should_stop():
+                log.info("Stopped by user — skipping Indeed site %s", site_name)
+                scrape_results.append({
+                    "site": site_name, "status": "stopped", "jobs": [],
+                    "job_count": 0, "attempts": 0, "duration_ms": 0,
+                    "error": "stopped by user",
+                })
+                continue
 
             last_error = ""
             started_at = time.monotonic()
             for attempt in range(1, MAX_RETRIES + 1):
+                if should_stop and should_stop():
+                    last_error = "stopped by user"
+                    break
                 try:
                     fetched_jobs = await safe_scrape(scrapers[0][1](), site_name)
                     if fetched_jobs:
@@ -568,6 +583,7 @@ def run_scraper(
     sites: list[str] | None = None,
     selected_sites: list[str] | None = None,
     target_sheet_id: str | None = None,
+    should_stop: "callable | None" = None,
 ) -> dict[str, Any]:
     chosen_sites = sites if sites is not None else selected_sites
     return asyncio.run(
@@ -575,5 +591,6 @@ def run_scraper(
             user_id=user_id,
             selected_sites=chosen_sites,
             target_sheet_id=target_sheet_id,
+            should_stop=should_stop,
         )
     )
