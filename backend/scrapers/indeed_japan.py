@@ -65,23 +65,34 @@ def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> req
 def _normalize_indeed_url(url: str) -> str:
     """
     Convert any Indeed URL variant to a canonical viewjob URL.
+    Returns an empty string for URLs that cannot be enriched (e.g. ad trackers).
 
-    RSS feeds and search results return redirect URLs like:
-      https://jp.indeed.com/rc/clk?jk=ABC123&...
-    We extract the job key (jk param) and return the stable viewjob URL.
-    If no jk param is found the original URL is returned unchanged.
+    URL types encountered in the wild:
+      /rc/clk?jk=ABC123&...          — organic click tracker, has jk param → OK
+      /viewjob?jk=ABC123             — canonical, already good → OK
+      /pagead/clk?mo=r&ad=...        — paid ad tracker, NO jk param, 500s on fetch → SKIP
+      /pagead/googleclk?...          — same, Google-served ad → SKIP
     """
     if not url:
-        return url
+        return ""
     if not url.startswith("http"):
         url = f"https://jp.indeed.com{url}"
 
     from urllib.parse import urlparse, parse_qs
     parsed = urlparse(url)
+
+    # Sponsored ad tracking URLs — ScraperAPI returns 500, no job key available.
+    # Returning "" signals to the caller that enrichment should be skipped.
+    if any(seg in parsed.path for seg in ("/pagead/clk", "/pagead/googleclk", "/pagead/")):
+        log.debug(f"[INDEED] Skipping ad-tracker URL (no job key): {url[:80]}")
+        return ""
+
     params = parse_qs(parsed.query)
     jk = params.get("jk", [None])[0]
     if jk:
         return f"https://jp.indeed.com/viewjob?jk={jk}"
+
+    # Unknown URL format — return as-is and let the fetch attempt decide
     return url
 
 
@@ -168,10 +179,14 @@ def _enrich_job_from_detail(job: Job) -> None:
     if not job.url:
         return
 
-    # Normalize redirect URLs (e.g. /rc/clk?jk=...) to canonical viewjob URLs
+    # Normalize redirect URLs (e.g. /rc/clk?jk=...) to canonical viewjob URLs.
+    # Returns "" for ad-tracker URLs (/pagead/clk) that cannot be enriched.
     canonical_url = _normalize_indeed_url(job.url)
+    if not canonical_url:
+        log.info(f"[INDEED] Skipping enrichment — ad-tracker URL: {job.url[:80]}")
+        return
     if canonical_url != job.url:
-        log.info(f"[INDEED] URL normalized: {job.url} → {canonical_url}")
+        log.info(f"[INDEED] URL normalized: {job.url[:60]} → {canonical_url}")
         job.url = canonical_url
 
     html: str = ""
@@ -606,10 +621,11 @@ def parse_html(html: str, query: str, location: str) -> list[dict]:
                 or card.find("span", class_=re.compile(r"salary|wage", re.I))
             )
 
-            # Job URL
+            # Job URL — prefer organic /rc/clk links; avoid /pagead/ ad trackers
             link_el = (
                 card.find("a", {"data-testid": re.compile(r"job|title", re.I)})
-                or card.find("a", href=re.compile(r"/rc/clk|/pagead/clk|/jobs/", re.I))
+                or card.find("a", href=re.compile(r"/rc/clk|/jobs/", re.I))
+                or card.find("a", href=re.compile(r"jk=", re.I))
                 or card.find("a", href=True)
             )
 
