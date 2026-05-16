@@ -14,6 +14,7 @@ import {
   getStatus,
   getStoredToken,
   startRun,
+  stopRun,
 } from "@/lib/api";
 import { useLocale } from "@/lib/i18n";
 import Sidebar from "@/components/Sidebar";
@@ -198,6 +199,8 @@ export default function DashboardPage() {
   const [running, setRunning] = useState(false);
   const [runStatus, setRunStatus] = useState<RunStatus | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── Initial load ──────────────────────────────────────────────────────────
@@ -255,22 +258,30 @@ export default function DashboardPage() {
   const handleRun = async () => {
     const token = getStoredToken();
     setRunning(true);
+    setStopping(false);
     setRunStatus(null);
     setRunError(null);
+    setCurrentRunId(null);
 
     try {
       const { run_id } = await startRun(token ?? undefined, [...activeSiteIds]);
+      setCurrentRunId(run_id);
 
-      // Poll every 3 seconds
+      // Poll every 3 seconds. Terminal statuses include "stopped" now —
+      // when the user clicks Stop, the backend marks the RunLog as "stopped"
+      // once the cooperative cancellation actually takes effect.
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = setInterval(async () => {
         try {
           const status = await getRun(run_id);
           setRunStatus(status);
-          if (status.status === "completed" || status.status === "failed") {
+          const terminal = ["completed", "failed", "stopped"].includes(status.status);
+          if (terminal) {
             clearInterval(pollIntervalRef.current!);
             pollIntervalRef.current = null;
             setRunning(false);
+            setStopping(false);
+            setCurrentRunId(null);
             if (status.status === "failed") setRunError(status.errors ?? t("dashboard.pollFailed"));
             // Refresh last run time
             const tok = getStoredToken();
@@ -282,11 +293,31 @@ export default function DashboardPage() {
           clearInterval(pollIntervalRef.current!);
           pollIntervalRef.current = null;
           setRunning(false);
+          setStopping(false);
+          setCurrentRunId(null);
         }
       }, 3000);
     } catch (err) {
       setRunning(false);
+      setStopping(false);
+      setCurrentRunId(null);
       setRunError(err instanceof Error ? err.message : "Failed to start run");
+    }
+  };
+
+  // ── Stop the running pipeline ────────────────────────────────────────────
+  const handleStop = async () => {
+    if (!currentRunId) return;
+    const token = getStoredToken();
+    setStopping(true);
+    try {
+      await stopRun(currentRunId, token ?? undefined);
+      // We DON'T tear down the polling interval here — the pipeline finishes
+      // its in-flight fetch first, then the next poll sees status="stopped"
+      // and the polling cleanup runs there.
+    } catch (err) {
+      setStopping(false);
+      setRunError(err instanceof Error ? err.message : "Failed to stop run");
     }
   };
 
@@ -345,19 +376,42 @@ export default function DashboardPage() {
             <p style={{ fontSize: "0.75rem", fontWeight: 600, color: "var(--color-text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "12px" }}>
               {t("dashboard.runNow")}
             </p>
-            <button
-              id="run-now-btn"
-              onClick={() => void handleRun()}
-              disabled={running}
-              className="btn-sakura btn-sm"
-              type="button"
-            >
-              {running ? t("dashboard.running") : "▶ " + t("dashboard.runNow")}
-            </button>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <button
+                id="run-now-btn"
+                onClick={() => void handleRun()}
+                disabled={running}
+                className="btn-sakura btn-sm"
+                type="button"
+              >
+                {running ? t("dashboard.running") : "▶ " + t("dashboard.runNow")}
+              </button>
+              {running && currentRunId && (
+                <button
+                  id="stop-run-btn"
+                  onClick={() => void handleStop()}
+                  disabled={stopping}
+                  className="btn-sm"
+                  type="button"
+                  style={{
+                    background: stopping ? "var(--color-bg-muted, #2a2a2a)" : "var(--color-danger, #dc2626)",
+                    color: "#fff",
+                    border: "1px solid var(--color-danger, #dc2626)",
+                    padding: "6px 14px",
+                    borderRadius: "6px",
+                    fontWeight: 600,
+                    cursor: stopping ? "wait" : "pointer",
+                  }}
+                  title="Stop will take effect after the current site finishes (≈5–10s). Already-spent ScraperAPI credits cannot be refunded."
+                >
+                  {stopping ? "⏳ Stopping…" : "■ Stop"}
+                </button>
+              )}
+            </div>
             {runError && (
               <p style={{ color: "var(--color-danger, #f87171)", fontSize: "0.8rem", marginTop: "8px" }}>{runError}</p>
             )}
-            {running && <ProgressBar label="Pipeline is running…" />}
+            {running && <ProgressBar label={stopping ? "Stopping after current site…" : "Pipeline is running…"} />}
           </div>
         </div>
 

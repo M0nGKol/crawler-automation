@@ -25,8 +25,18 @@ RSS_LIMIT_PER_QUERY: int = int(os.getenv("INDEED_RSS_LIMIT", "15"))
 
 # Hard cap on ScraperAPI detail-page calls per full pipeline run.
 # render=true costs 5-10× more credits; this keeps a run predictable.
-# Set INDEED_MAX_DETAIL_FETCHES=0 in env to disable enrichment entirely.
-MAX_DETAIL_FETCHES: int = int(os.getenv("INDEED_MAX_DETAIL_FETCHES", "20"))
+#
+# DEFAULT = 0 (disabled). Indeed Japan's viewjob pages are behind Cloudflare;
+# in practice BOTH render=false and render=true consistently fail validation,
+# wasting 6-11 credits per detail attempt with zero data extracted. Keep this
+# disabled unless you upgrade ScraperAPI to premium=true / ultra_premium=true.
+# Set INDEED_MAX_DETAIL_FETCHES=20 in env to re-enable enrichment.
+MAX_DETAIL_FETCHES: int = int(os.getenv("INDEED_MAX_DETAIL_FETCHES", "0"))
+
+# Circuit breaker: abort the rest of the enrichment pass after this many
+# consecutive failures. Stops the bleeding when Cloudflare is blocking every
+# request — saves ~150 credits/run when ScraperAPI can't get through.
+ENRICHMENT_FAILURE_CIRCUIT_BREAKER: int = int(os.getenv("INDEED_ENRICHMENT_CIRCUIT", "3"))
 
 # Fields that must be populated for a job to skip the detail-page fetch.
 _ENRICHMENT_FIELDS = ("requirements", "employment_type", "application_deadline", "job_description")
@@ -144,9 +154,12 @@ def _enrich_jobs(jobs: list[Job]) -> list[Job]:
        render=true (5-10 credits) if the response fails validation.
        In practice, Indeed Japan embeds all structured data in JSON-LD
        which is SSR-rendered — so render=false is usually sufficient.
+    4. Circuit breaker: after N consecutive failures, abort the rest of
+       the pass. Indeed Japan often Cloudflare-blocks every request — once
+       that pattern is established, retrying just burns credits.
     """
     if MAX_DETAIL_FETCHES == 0:
-        log.info("[INDEED] Enrichment disabled (INDEED_MAX_DETAIL_FETCHES=0)")
+        log.info("[INDEED] Enrichment disabled (INDEED_MAX_DETAIL_FETCHES=0) — RSS fields only")
         return jobs
 
     needs = [j for j in jobs if _needs_enrichment(j)]
@@ -159,15 +172,37 @@ def _enrich_jobs(jobs: list[Job]) -> list[Job]:
         f"(+{complete} already complete, +{capped} skipped by cap)"
     )
 
+    consecutive_failures = 0
+    fetched = 0
+    aborted = False
     for job in to_fetch:
-        _enrich_job_from_detail(job)
+        ok = _enrich_job_from_detail(job)
+        fetched += 1
+        if ok:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            if consecutive_failures >= ENRICHMENT_FAILURE_CIRCUIT_BREAKER:
+                log.error(
+                    "[INDEED] Circuit breaker tripped after %d consecutive failures — "
+                    "aborting enrichment for this run (saved %d further attempts)",
+                    consecutive_failures,
+                    len(to_fetch) - fetched,
+                )
+                aborted = True
+                break
 
+    if not aborted:
+        log.info("[INDEED] Enrichment pass complete: %d attempts", fetched)
     return jobs
 
 
-def _enrich_job_from_detail(job: Job) -> None:
+def _enrich_job_from_detail(job: Job) -> bool:
     """
     Fetch the job detail page and extract missing fields. Mutates in-place.
+
+    Returns True if any data was extracted, False if both fetch attempts failed
+    or the URL was skippable. The caller uses this for circuit-breaker logic.
 
     Credit strategy (cheapest-first):
     1. Try render=false (1 credit) — JSON-LD structured data is SSR-rendered
@@ -177,14 +212,15 @@ def _enrich_job_from_detail(job: Job) -> None:
     3. If both fail, log a warning and leave the fields empty.
     """
     if not job.url:
-        return
+        return False
 
     # Normalize redirect URLs (e.g. /rc/clk?jk=...) to canonical viewjob URLs.
     # Returns "" for ad-tracker URLs (/pagead/clk) that cannot be enriched.
     canonical_url = _normalize_indeed_url(job.url)
     if not canonical_url:
         log.info(f"[INDEED] Skipping enrichment — ad-tracker URL: {job.url[:80]}")
-        return
+        # Don't count "skipped because unfetchable URL" as a circuit-breaker failure.
+        return True
     if canonical_url != job.url:
         log.info(f"[INDEED] URL normalized: {job.url[:60]} → {canonical_url}")
         job.url = canonical_url
@@ -205,10 +241,10 @@ def _enrich_job_from_detail(job: Job) -> None:
                 log.info(f"[INDEED] Detail OK with render=true: {canonical_url}")
             else:
                 log.warning(f"[INDEED] Both render attempts failed for: {canonical_url}")
-                return
+                return False
     except Exception as e:
         log.warning(f"[INDEED] Detail fetch failed for {canonical_url}: {e}")
-        return
+        return False
 
     extracted = _extract_detail_fields(html)
 
@@ -228,6 +264,7 @@ def _enrich_job_from_detail(job: Job) -> None:
 
     filled = [f for f in _ENRICHMENT_FIELDS if getattr(job, f, "")]
     log.info(f"[INDEED] Enriched {job.job_title[:40]!r} — filled: {filled}")
+    return True
 
 
 def _extract_from_json_ld(soup) -> dict:
