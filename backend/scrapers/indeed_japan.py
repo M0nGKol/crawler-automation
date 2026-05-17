@@ -1,9 +1,11 @@
+import json
 import os
 import hashlib
 import logging
 import re
 from datetime import datetime
 import xml.etree.ElementTree as ET
+from typing import Any
 
 import requests
 
@@ -20,22 +22,14 @@ SEARCH_QUERIES = [
 ]
 
 # ── Credit-saving limits ──────────────────────────────────────────────────────
-# How many jobs to pull per RSS query. Lower = fewer detail-page requests.
 RSS_LIMIT_PER_QUERY: int = int(os.getenv("INDEED_RSS_LIMIT", "15"))
 
-# Hard cap on ScraperAPI detail-page calls per full pipeline run.
-# render=true costs 5-10× more credits; this keeps a run predictable.
-#
-# DEFAULT = 0 (disabled). Indeed Japan's viewjob pages are behind Cloudflare;
-# in practice BOTH render=false and render=true consistently fail validation,
-# wasting 6-11 credits per detail attempt with zero data extracted. Keep this
-# disabled unless you upgrade ScraperAPI to premium=true / ultra_premium=true.
-# Set INDEED_MAX_DETAIL_FETCHES=20 in env to re-enable enrichment.
-MAX_DETAIL_FETCHES: int = int(os.getenv("INDEED_MAX_DETAIL_FETCHES", "0"))
+# How many detail-page fetches to attempt per pipeline run.
+# Now defaults to 15 — curl_cffi handles Cloudflare without spending ScraperAPI
+# credits, so enrichment is cheap.
+MAX_DETAIL_FETCHES: int = int(os.getenv("INDEED_MAX_DETAIL_FETCHES", "15"))
 
-# Circuit breaker: abort the rest of the enrichment pass after this many
-# consecutive failures. Stops the bleeding when Cloudflare is blocking every
-# request — saves ~150 credits/run when ScraperAPI can't get through.
+# Circuit breaker: abort enrichment after this many consecutive failures.
 ENRICHMENT_FAILURE_CIRCUIT_BREAKER: int = int(os.getenv("INDEED_ENRICHMENT_CIRCUIT", "3"))
 
 # Fields that must be populated for a job to skip the detail-page fetch.
@@ -44,15 +38,44 @@ _ENRICHMENT_FIELDS = ("requirements", "employment_type", "application_deadline",
 
 # ── Fetch helpers ─────────────────────────────────────────────────────────────
 
-def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> requests.Response:
-    """Fetch URL directly or via ScraperAPI.
-
-    render_js=True should be used for detail pages — Indeed Japan's job pages
-    are protected by Cloudflare and require JavaScript execution to serve real HTML.
-    render_js=False is fine for listing/search pages and RSS feeds.
+def _fetch_with_curl_cffi(url: str) -> str | None:
     """
+    Fetch a URL by impersonating Chrome's TLS fingerprint via curl_cffi.
+
+    Cloudflare checks the TLS handshake and HTTP/2 fingerprint to distinguish
+    real browsers from bots. curl_cffi replicates Chrome's exact fingerprint
+    at the C library level — no browser process, ~15MB RAM, free to run.
+
+    Returns the response text on success, None on any failure.
+    """
+    try:
+        from curl_cffi import requests as cf_requests
+        resp = cf_requests.get(
+            url,
+            impersonate="chrome120",
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            timeout=30,
+            allow_redirects=True,
+        )
+        if resp.status_code == 200:
+            return resp.text
+        log.warning("[INDEED] curl_cffi got status %d for %s", resp.status_code, url[:80])
+        return None
+    except ImportError:
+        log.warning("[INDEED] curl_cffi not installed — falling back to ScraperAPI")
+        return None
+    except Exception as exc:
+        log.warning("[INDEED] curl_cffi fetch failed for %s: %s", url[:80], exc)
+        return None
+
+
+def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> requests.Response:
+    """Fetch URL directly or via ScraperAPI (used for listing/search pages)."""
     if use_proxy and SCRAPERAPI_KEY:
-        log.info(f"[INDEED] ScraperAPI (render={render_js}) for: {url}")
+        log.info("[INDEED] ScraperAPI (render=%s) for: %s", render_js, url[:80])
         return requests.get(
             "http://api.scraperapi.com",
             params={
@@ -61,10 +84,9 @@ def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> req
                 "country_code": "jp",
                 "render": "true" if render_js else "false",
             },
-            timeout=60,  # JS rendering needs extra time
+            timeout=60,
         )
-
-    log.info(f"[INDEED] Direct fetch: {url}")
+    log.info("[INDEED] Direct fetch: %s", url[:80])
     return requests.get(
         url,
         headers={"User-Agent": "Mozilla/5.0 (compatible; RSS reader)"},
@@ -75,13 +97,7 @@ def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> req
 def _normalize_indeed_url(url: str) -> str:
     """
     Convert any Indeed URL variant to a canonical viewjob URL.
-    Returns an empty string for URLs that cannot be enriched (e.g. ad trackers).
-
-    URL types encountered in the wild:
-      /rc/clk?jk=ABC123&...          — organic click tracker, has jk param → OK
-      /viewjob?jk=ABC123             — canonical, already good → OK
-      /pagead/clk?mo=r&ad=...        — paid ad tracker, NO jk param, 500s on fetch → SKIP
-      /pagead/googleclk?...          — same, Google-served ad → SKIP
+    Returns an empty string for ad-tracker URLs that cannot be enriched.
     """
     if not url:
         return ""
@@ -91,10 +107,8 @@ def _normalize_indeed_url(url: str) -> str:
     from urllib.parse import urlparse, parse_qs
     parsed = urlparse(url)
 
-    # Sponsored ad tracking URLs — ScraperAPI returns 500, no job key available.
-    # Returning "" signals to the caller that enrichment should be skipped.
     if any(seg in parsed.path for seg in ("/pagead/clk", "/pagead/googleclk", "/pagead/")):
-        log.debug(f"[INDEED] Skipping ad-tracker URL (no job key): {url[:80]}")
+        log.debug("[INDEED] Skipping ad-tracker URL: %s", url[:80])
         return ""
 
     params = parse_qs(parsed.query)
@@ -102,64 +116,108 @@ def _normalize_indeed_url(url: str) -> str:
     if jk:
         return f"https://jp.indeed.com/viewjob?jk={jk}"
 
-    # Unknown URL format — return as-is and let the fetch attempt decide
     return url
 
 
 def _is_valid_job_page(html: str) -> bool:
-    """
-    Return True only if the HTML looks like a real Indeed job detail page.
-    Rejects Cloudflare challenge pages, empty responses, and error pages.
-    """
+    """Return True only if HTML looks like a real Indeed job detail page."""
     if not html or len(html) < 500:
         return False
-    # Cloudflare / bot detection markers
     if any(marker in html for marker in [
-        "challenge-platform",
-        "cf-browser-verification",
-        "Just a moment",
-        "Checking your browser",
-        "Enable JavaScript",
-        "cf_chl_",
+        "challenge-platform", "cf-browser-verification",
+        "Just a moment", "Checking your browser",
+        "Enable JavaScript", "cf_chl_",
     ]):
         return False
-    # Must contain at least one indicator that this is a real Indeed page
     return any(marker in html for marker in [
-        "jobDescriptionText",
-        "jobsearch-JobComponent",
-        "viewJobSSRRoot",
-        "jobDescription",
-        "icl-u-xs",
-        "雇用形態",
-        "給与",
-        "勤務地",
+        "jobDescriptionText", "jobsearch-JobComponent",
+        "viewJobSSRRoot", "jobDescription",
+        "icl-u-xs", "雇用形態", "給与", "勤務地",
     ])
+
+
+# ── Claude extraction ─────────────────────────────────────────────────────────
+
+def _trim_html(html: str, max_chars: int = 20_000) -> str:
+    """Strip navigation/footer noise before sending to Claude."""
+    body = html
+    for tag in ("script", "style", "nav", "footer", "header", "head"):
+        body = re.sub(rf"<{tag}[\s>].*?</{tag}>", "", body, flags=re.DOTALL | re.IGNORECASE)
+    for pattern in (
+        r"<main[\s>].*?</main>",
+        r"<article[\s>].*?</article>",
+        r'<div[^>]+(?:id|class)=["\'][^"\']*(?:content|detail|job)[^"\']*["\'][^>]*>.*?</div>',
+    ):
+        match = re.search(pattern, body, re.DOTALL | re.IGNORECASE)
+        if match and len(match.group(0)) > 500:
+            return match.group(0)[:max_chars]
+    return body[:max_chars]
+
+
+def _extract_with_claude(html: str, job: Job, claude: Any) -> dict:
+    """
+    Send trimmed HTML to Claude Haiku and extract all structured job fields.
+    Same pattern used by detail_enricher.py for other sites.
+    """
+    body = _trim_html(html)
+    log.info("[INDEED] Sending %d chars to Claude for extraction", len(body))
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2000,
+            system=(
+                "You extract structured data from Japanese job detail pages. "
+                "Return ONLY a JSON object — no markdown fences, no commentary. "
+                "Use the exact field names below. Use empty string for any field you cannot find. "
+                "Quote text verbatim from the page when possible.\n\n"
+                "Fields:\n"
+                '  "raw_facility": company or hospital name\n'
+                '  "location": full work address or area\n'
+                '  "job_description": role description verbatim (仕事内容)\n'
+                '  "requirements": qualifications needed (応募資格, 必要資格)\n'
+                '  "salary_raw": salary text verbatim (給与, 月給, 時給, 年収)\n'
+                '  "employment_type": 正社員 / パート / 契約社員 / etc (雇用形態)\n'
+                '  "application_deadline": deadline (応募期限, 締切)\n'
+                '  "contact_information": phone, email, or contact name (連絡先)\n'
+            ),
+            messages=[{
+                "role": "user",
+                "content": f"URL: {job.url}\n\nHTML:\n{body}",
+            }],
+        )
+        raw = response.content[0].text.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        data = json.loads(raw)
+        return {k: str(v or "").strip() for k, v in data.items() if isinstance(data, dict)}
+    except json.JSONDecodeError as exc:
+        log.warning("[INDEED] Claude JSON parse failed: %s", exc)
+        return {}
+    except Exception as exc:
+        log.warning("[INDEED] Claude extraction failed: %s", exc)
+        return {}
 
 
 # ── Two-pass detail enrichment ────────────────────────────────────────────────
 
 def _needs_enrichment(job: Job) -> bool:
-    """Return True if any critical field is still empty — triggers a detail fetch."""
     return any(not getattr(job, field, "") for field in _ENRICHMENT_FIELDS)
 
 
-def _enrich_jobs(jobs: list[Job]) -> list[Job]:
+def _enrich_jobs(jobs: list[Job], claude: Any = None) -> list[Job]:
     """
     Pass 2: visit each job's detail page to fill empty fields.
 
-    Credit-saving rules applied here:
-    1. Skip jobs that already have complete data (free).
-    2. Hard cap: at most MAX_DETAIL_FETCHES ScraperAPI calls per run.
-    3. Each call tries render=false first (1 credit); only upgrades to
-       render=true (5-10 credits) if the response fails validation.
-       In practice, Indeed Japan embeds all structured data in JSON-LD
-       which is SSR-rendered — so render=false is usually sufficient.
-    4. Circuit breaker: after N consecutive failures, abort the rest of
-       the pass. Indeed Japan often Cloudflare-blocks every request — once
-       that pattern is established, retrying just burns credits.
+    Fetch priority (cheapest first):
+      1. curl_cffi Chrome impersonation — free, bypasses Cloudflare TLS check
+      2. ScraperAPI render=false        — 1 credit, fallback if curl_cffi fails
+      3. ScraperAPI render=true         — 5-10 credits, last resort
+
+    Extraction: Claude Haiku if available, else BeautifulSoup/regex fallback.
     """
     if MAX_DETAIL_FETCHES == 0:
-        log.info("[INDEED] Enrichment disabled (INDEED_MAX_DETAIL_FETCHES=0) — RSS fields only")
+        log.info("[INDEED] Enrichment disabled (INDEED_MAX_DETAIL_FETCHES=0)")
         return jobs
 
     needs = [j for j in jobs if _needs_enrichment(j)]
@@ -168,15 +226,14 @@ def _enrich_jobs(jobs: list[Job]) -> list[Job]:
     capped = len(needs) - len(to_fetch)
 
     log.info(
-        f"[INDEED] Enrichment pass: {len(to_fetch)} detail fetches "
-        f"(+{complete} already complete, +{capped} skipped by cap)"
+        "[INDEED] Enrichment: %d detail fetches (+%d complete, +%d capped)",
+        len(to_fetch), complete, capped,
     )
 
     consecutive_failures = 0
     fetched = 0
-    aborted = False
     for job in to_fetch:
-        ok = _enrich_job_from_detail(job)
+        ok = _enrich_job_from_detail(job, claude=claude)
         fetched += 1
         if ok:
             consecutive_failures = 0
@@ -185,126 +242,119 @@ def _enrich_jobs(jobs: list[Job]) -> list[Job]:
             if consecutive_failures >= ENRICHMENT_FAILURE_CIRCUIT_BREAKER:
                 log.error(
                     "[INDEED] Circuit breaker tripped after %d consecutive failures — "
-                    "aborting enrichment for this run (saved %d further attempts)",
-                    consecutive_failures,
-                    len(to_fetch) - fetched,
+                    "aborting enrichment (saved %d further attempts)",
+                    consecutive_failures, len(to_fetch) - fetched,
                 )
-                aborted = True
                 break
 
-    if not aborted:
-        log.info("[INDEED] Enrichment pass complete: %d attempts", fetched)
+    log.info("[INDEED] Enrichment complete: %d attempts", fetched)
     return jobs
 
 
-def _enrich_job_from_detail(job: Job) -> bool:
+def _enrich_job_from_detail(job: Job, claude: Any = None) -> bool:
     """
-    Fetch the job detail page and extract missing fields. Mutates in-place.
+    Fetch the job detail page and fill missing fields. Mutates job in-place.
 
-    Returns True if any data was extracted, False if both fetch attempts failed
-    or the URL was skippable. The caller uses this for circuit-breaker logic.
-
-    Credit strategy (cheapest-first):
-    1. Try render=false (1 credit) — JSON-LD structured data is SSR-rendered
-       on Indeed Japan viewjob pages and doesn't need JavaScript.
-    2. If the page fails the validity check (Cloudflare challenge), upgrade to
-       render=true (5-10 credits) as a last resort.
-    3. If both fail, log a warning and leave the fields empty.
+    Returns True if any data was extracted or URL was skippable (for circuit
+    breaker logic — only persistent fetch failures count as a failure).
     """
     if not job.url:
         return False
 
-    # Normalize redirect URLs (e.g. /rc/clk?jk=...) to canonical viewjob URLs.
-    # Returns "" for ad-tracker URLs (/pagead/clk) that cannot be enriched.
     canonical_url = _normalize_indeed_url(job.url)
     if not canonical_url:
-        log.info(f"[INDEED] Skipping enrichment — ad-tracker URL: {job.url[:80]}")
-        # Don't count "skipped because unfetchable URL" as a circuit-breaker failure.
-        return True
+        log.info("[INDEED] Skipping ad-tracker URL: %s", job.url[:80])
+        return True  # not a failure — just unenrichable
     if canonical_url != job.url:
-        log.info(f"[INDEED] URL normalized: {job.url[:60]} → {canonical_url}")
+        log.info("[INDEED] URL normalized: %s → %s", job.url[:60], canonical_url[:60])
         job.url = canonical_url
 
     html: str = ""
-    try:
-        # ── Attempt 1: render=false (cheap, 1 credit) ───────────────────────
-        resp = fetch_url(canonical_url, use_proxy=True, render_js=False)
-        if resp.status_code == 200 and _is_valid_job_page(resp.text):
-            html = resp.text
-            log.info(f"[INDEED] Detail OK with render=false (cheap): {canonical_url}")
-        else:
-            # ── Attempt 2: render=true (expensive, 5-10 credits) ────────────
-            log.info(f"[INDEED] render=false invalid ({resp.status_code}), upgrading to render=true: {canonical_url}")
-            resp2 = fetch_url(canonical_url, use_proxy=True, render_js=True)
-            if resp2.status_code == 200 and _is_valid_job_page(resp2.text):
-                html = resp2.text
-                log.info(f"[INDEED] Detail OK with render=true: {canonical_url}")
-            else:
-                log.warning(f"[INDEED] Both render attempts failed for: {canonical_url}")
+
+    # ── Attempt 1: curl_cffi Chrome impersonation (free) ─────────────────────
+    fetched_html = _fetch_with_curl_cffi(canonical_url)
+    if fetched_html and _is_valid_job_page(fetched_html):
+        html = fetched_html
+        log.info("[INDEED] Detail OK via curl_cffi: %s", canonical_url[:60])
+    else:
+        # ── Attempt 2: ScraperAPI render=false (1 credit) ────────────────────
+        if SCRAPERAPI_KEY:
+            try:
+                resp = fetch_url(canonical_url, use_proxy=True, render_js=False)
+                if resp.status_code == 200 and _is_valid_job_page(resp.text):
+                    html = resp.text
+                    log.info("[INDEED] Detail OK via ScraperAPI render=false: %s", canonical_url[:60])
+                else:
+                    # ── Attempt 3: ScraperAPI render=true (5-10 credits) ─────
+                    log.info("[INDEED] render=false invalid — upgrading to render=true")
+                    resp2 = fetch_url(canonical_url, use_proxy=True, render_js=True)
+                    if resp2.status_code == 200 and _is_valid_job_page(resp2.text):
+                        html = resp2.text
+                        log.info("[INDEED] Detail OK via ScraperAPI render=true: %s", canonical_url[:60])
+                    else:
+                        log.warning("[INDEED] All fetch attempts failed for: %s", canonical_url[:60])
+                        return False
+            except Exception as exc:
+                log.warning("[INDEED] ScraperAPI fetch failed for %s: %s", canonical_url[:60], exc)
                 return False
-    except Exception as e:
-        log.warning(f"[INDEED] Detail fetch failed for {canonical_url}: {e}")
-        return False
+        else:
+            log.warning("[INDEED] curl_cffi failed and no SCRAPERAPI_KEY — skipping: %s", canonical_url[:60])
+            return False
 
+    # ── Extraction: Claude (preferred) or BeautifulSoup/regex fallback ────────
+    if claude:
+        extracted = _extract_with_claude(html, job, claude)
+        if extracted:
+            _fill_fields(job, extracted)
+            filled = [f for f in _ENRICHMENT_FIELDS if getattr(job, f, "")]
+            log.info("[INDEED] Claude enriched %r — filled: %s", job.job_title[:40], filled)
+            return True
+
+    # Fallback to original regex/BeautifulSoup extraction
     extracted = _extract_detail_fields(html)
-
-    # Only overwrite fields that are currently empty on the job object
-    if not job.job_description and extracted.get("job_description"):
-        job.job_description = extracted["job_description"]
-    if not job.requirements and extracted.get("requirements"):
-        job.requirements = extracted["requirements"]
-    if not job.employment_type and extracted.get("employment_type"):
-        job.employment_type = extracted["employment_type"]
-    if not job.application_deadline and extracted.get("application_deadline"):
-        job.application_deadline = extracted["application_deadline"]
-    if not job.contact_information and extracted.get("contact_information"):
-        job.contact_information = extracted["contact_information"]
-    if not job.salary_raw and extracted.get("salary_raw"):
-        job.salary_raw = extracted["salary_raw"]
-
+    _fill_fields(job, extracted)
     filled = [f for f in _ENRICHMENT_FIELDS if getattr(job, f, "")]
-    log.info(f"[INDEED] Enriched {job.job_title[:40]!r} — filled: {filled}")
+    log.info("[INDEED] BS/regex enriched %r — filled: %s", job.job_title[:40], filled)
     return True
 
 
-def _extract_from_json_ld(soup) -> dict:
-    """
-    Extract job fields from JSON-LD structured data embedded in the page.
-
-    Indeed Japan injects a <script type="application/ld+json"> block containing
-    a JobPosting schema on every viewjob page for SEO purposes. This is
-    server-side rendered so it's available even with render=false (no JS needed).
-    This is the cheapest extraction path — 1 credit vs 5-10 for render=true.
-    """
-    import json
-
-    result: dict = {
-        "job_description": "",
-        "requirements": "",
-        "employment_type": "",
-        "application_deadline": "",
-        "contact_information": "",
-        "salary_raw": "",
+def _fill_fields(job: Job, extracted: dict) -> None:
+    """Copy extracted values into job fields — only overwrites empty fields."""
+    field_map = {
+        "job_description": "job_description",
+        "requirements": "requirements",
+        "salary_raw": "salary_raw",
+        "employment_type": "employment_type",
+        "application_deadline": "application_deadline",
+        "contact_information": "contact_information",
+        "raw_facility": "raw_facility",
     }
+    for src, dst in field_map.items():
+        value = extracted.get(src, "")
+        if value and not getattr(job, dst, ""):
+            setattr(job, dst, value)
 
+
+# ── BeautifulSoup / regex extraction (fallback when Claude unavailable) ───────
+
+def _extract_from_json_ld(soup) -> dict:
+    """Extract job fields from JSON-LD structured data embedded in the page."""
+    result: dict = {
+        "job_description": "", "requirements": "", "employment_type": "",
+        "application_deadline": "", "contact_information": "", "salary_raw": "",
+    }
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
         except (json.JSONDecodeError, TypeError):
             continue
-
-        # Handle both a single object and an array
         items = data if isinstance(data, list) else [data]
         for item in items:
             if item.get("@type") not in ("JobPosting", "jobPosting"):
                 continue
-
-            # Description
             if item.get("description") and not result["job_description"]:
                 desc = re.sub(r"<[^>]+>", " ", str(item["description"]))
                 result["job_description"] = desc.strip()[:2000]
-
-            # Employment type (may be English like "FULL_TIME" — translate)
             _ET_MAP = {
                 "FULL_TIME": "正社員", "PART_TIME": "パート・アルバイト",
                 "CONTRACTOR": "契約社員", "TEMPORARY": "派遣社員",
@@ -313,12 +363,8 @@ def _extract_from_json_ld(soup) -> dict:
             et = item.get("employmentType", "")
             if et and not result["employment_type"]:
                 result["employment_type"] = _ET_MAP.get(et.upper(), et)
-
-            # Application deadline
             if item.get("validThrough") and not result["application_deadline"]:
                 result["application_deadline"] = str(item["validThrough"])[:20]
-
-            # Salary
             base = item.get("baseSalary", {})
             if base and not result["salary_raw"]:
                 val = base.get("value", {})
@@ -327,75 +373,39 @@ def _extract_from_json_ld(soup) -> dict:
                     mx = val.get("maxValue", "")
                     unit_map = {"HOUR": "時給", "DAY": "日給", "WEEK": "週給", "MONTH": "月給", "YEAR": "年収"}
                     unit = unit_map.get(str(val.get("unitText", "")).upper(), "")
-                    currency = base.get("currency", "JPY")
                     if mn and mx:
-                        result["salary_raw"] = f"{unit}{mn}〜{mx}{currency}"
+                        result["salary_raw"] = f"{unit}{mn}〜{mx}円"
                     elif mn or mx:
-                        result["salary_raw"] = f"{unit}{mn or mx}{currency}"
-                elif val:
-                    result["salary_raw"] = str(val)
-
-            # Hiring org contact
+                        result["salary_raw"] = f"{unit}{mn or mx}円"
             org = item.get("hiringOrganization", {})
             if isinstance(org, dict) and not result["contact_information"]:
-                contact_parts = [p for p in [
-                    org.get("name", ""),
-                    org.get("telephone", ""),
-                    org.get("email", ""),
-                ] if p]
-                if contact_parts:
-                    result["contact_information"] = " / ".join(contact_parts)[:200]
-
-            log.debug(f"[INDEED] JSON-LD extracted: {list(k for k,v in result.items() if v)}")
-            return result  # found a JobPosting — done
-
-    return result  # no JSON-LD found or no matching @type
+                parts = [p for p in [org.get("name", ""), org.get("telephone", ""), org.get("email", "")] if p]
+                if parts:
+                    result["contact_information"] = " / ".join(parts)[:200]
+            return result
+    return result
 
 
 def _extract_detail_fields(html: str) -> dict:
-    """
-    Parse an Indeed Japan job detail page and extract all structured fields.
-
-    Strategy (cheapest-first):
-    1. JSON-LD structured data  — SSR, works with render=false, zero extra cost
-    2. CSS selector fallbacks   — SSR div elements
-    3. Full-text regex          — last resort
-
-    Returns a dict — missing fields are empty strings.
-    """
+    """Parse an Indeed Japan detail page with BeautifulSoup + regex (Claude fallback)."""
     from bs4 import BeautifulSoup
-
     soup = BeautifulSoup(html, "html.parser")
-
-    # ── Strategy 1: JSON-LD (cheapest, most reliable) ────────────────────────
     result = _extract_from_json_ld(soup)
 
-    # If JSON-LD gave us everything we need, return immediately
     if all(result.get(f) for f in ("job_description", "employment_type")):
-        log.info("[INDEED] Extraction complete via JSON-LD (no CSS/regex needed)")
         return result
 
-    # ── Strategy 2 & 3: CSS + regex fallback for still-empty fields ──────────
-    # (only runs when JSON-LD was missing or incomplete)
-
-    # ── Job Description ───────────────────────────────────────────────────────
-    # Indeed Japan uses id="jobDescriptionText" on its SSR-rendered viewjob pages.
     desc_el = (
         soup.find("div", id="jobDescriptionText")
         or soup.find("div", attrs={"data-testid": "jobsearch-JobComponent-description"})
         or soup.find("div", class_=re.compile(r"jobDescription|jobsearch-jobDescriptionText", re.I))
-        or soup.find("div", id=re.compile(r"jobDescription", re.I))
     )
     if desc_el:
         result["job_description"] = desc_el.get_text(separator="\n", strip=True)[:2000]
 
-    # ── Salary ────────────────────────────────────────────────────────────────
-    # viewjob pages put salary in a metadata table or attribute_snippet span.
     salary_candidates = (
         soup.find_all(attrs={"data-testid": "attribute_snippet_testid"})
         + soup.find_all("div", class_=re.compile(r"salary|wage", re.I))
-        + soup.find_all("span", class_=re.compile(r"salary|icl-u-xs", re.I))
-        + soup.find_all("div", class_=re.compile(r"icl-u-xs", re.I))
     )
     for el in salary_candidates:
         text = el.get_text(strip=True)
@@ -405,79 +415,43 @@ def _extract_detail_fields(html: str) -> dict:
 
     full_text = soup.get_text(separator="\n")
 
-    # ── Employment Type ───────────────────────────────────────────────────────
-    # First try structured metadata rows (viewjob pages render these as labelled divs)
     employment_el = soup.find(string=re.compile(r"雇用形態|勤務形態"))
     if employment_el:
         parent = employment_el.find_parent()
-        if parent:
-            # Sibling or parent's next sibling typically holds the value
-            sibling = parent.find_next_sibling()
-            if sibling:
-                result["employment_type"] = sibling.get_text(strip=True)[:100]
+        sibling = parent.find_next_sibling() if parent else None
+        if sibling:
+            result["employment_type"] = sibling.get_text(strip=True)[:100]
     if not result["employment_type"]:
-        employment_keywords = ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "嘱託"]
-        for keyword in employment_keywords:
+        for keyword in ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "非常勤"]:
             if keyword in full_text:
-                match = re.search(
-                    rf"(雇用形態|勤務形態)[^\n]*{keyword}|{keyword}[^\n]*(雇用|勤務|契約)",
-                    full_text,
-                )
-                result["employment_type"] = match.group(0).strip()[:100] if match else keyword
+                result["employment_type"] = keyword
                 break
 
-    # ── Application Deadline ──────────────────────────────────────────────────
-    deadline_patterns = [
+    for pattern in [
         r"応募締切[^\n：:]*[:：]?\s*([^\n]+)",
-        r"募集期間[^\n：:]*[:：]?\s*([^\n]+)",
         r"締切[^\n：:]*[:：]?\s*(\d{4}[年/\-]\d{1,2}[月/\-]\d{1,2})",
         r"(\d{4}年\d{1,2}月\d{1,2}日).*?まで",
-        r"(\d{4}/\d{1,2}/\d{1,2}).*?締",
-        r"(\d{4}-\d{2}-\d{2}).*?締",
-    ]
-    for pattern in deadline_patterns:
+    ]:
         match = re.search(pattern, full_text)
         if match:
-            captured = (match.group(1) if match.lastindex and match.group(1) else match.group(0))
-            result["application_deadline"] = captured.strip()[:100]
+            result["application_deadline"] = (match.group(1) if match.lastindex else match.group(0)).strip()[:100]
             break
 
-    # ── Contact Information ───────────────────────────────────────────────────
-    contact_patterns = [
-        r"(採用担当[^\n]{0,100})",
-        r"(お問い合わせ[^\n]{0,100})",
-        r"(TEL[^\n]{0,80})",
-        r"(電話[^\n：:]*[:：]?\s*[\d\-（）()]+)",
-        r"([\w.+-]+@[\w\-]+\.[a-z]{2,})",
-    ]
-    for pattern in contact_patterns:
+    for pattern in [
+        r"(採用担当[^\n]{0,100})", r"(TEL[^\n]{0,80})",
+        r"(電話[^\n：:]*[:：]?\s*[\d\-（）()]+)", r"([\w.+-]+@[\w\-]+\.[a-z]{2,})",
+    ]:
         match = re.search(pattern, full_text)
         if match:
             result["contact_information"] = match.group(1).strip()[:200]
             break
 
-    # ── Requirements ──────────────────────────────────────────────────────────
-    # Try structured element first, then regex on full text
-    req_el = soup.find(string=re.compile(r"応募資格|必要資格|応募条件|資格要件|必須スキル"))
+    req_el = soup.find(string=re.compile(r"応募資格|必要資格|応募条件"))
     if req_el:
         parent = req_el.find_parent()
-        if parent:
-            block = parent.find_next_sibling() or parent.find_parent()
-            if block:
-                result["requirements"] = block.get_text(separator="\n", strip=True)[:500]
-    if not result["requirements"]:
-        req_patterns = [
-            r"応募資格\s*([^\n].{10,500}?)(?=\n\n|\Z)",
-            r"必要資格\s*([^\n].{10,500}?)(?=\n\n|\Z)",
-            r"応募条件\s*([^\n].{10,500}?)(?=\n\n|\Z)",
-            r"資格要件\s*([^\n].{10,500}?)(?=\n\n|\Z)",
-            r"必須スキル\s*([^\n].{10,500}?)(?=\n\n|\Z)",
-        ]
-        for pattern in req_patterns:
-            match = re.search(pattern, full_text, re.DOTALL)
-            if match:
-                result["requirements"] = match.group(1).strip()[:500]
-                break
+        block = parent.find_next_sibling() if parent else None
+        if block:
+            result["requirements"] = block.get_text(separator="\n", strip=True)[:500]
 
     return result
 
@@ -485,7 +459,6 @@ def _extract_detail_fields(html: str) -> dict:
 # ── Domain model conversion ───────────────────────────────────────────────────
 
 def _dict_jobs_to_domain_jobs(job_dicts: list[dict]) -> list[Job]:
-    """Convert the job dictionaries into our internal domain.job.Job objects."""
     jobs: list[Job] = []
     for jd in job_dicts:
         job = Job(
@@ -502,7 +475,6 @@ def _dict_jobs_to_domain_jobs(job_dicts: list[dict]) -> list[Job]:
             contact_information=str(jd.get("contact_information", "") or ""),
             url=str(jd.get("url", "") or ""),
         )
-        # Preserve the deterministic id/scraped_at generated by the scraper
         job.id = str(jd.get("id", job.id))
         scraped_at = jd.get("scraped_at") or None
         if scraped_at:
@@ -513,11 +485,10 @@ def _dict_jobs_to_domain_jobs(job_dicts: list[dict]) -> list[Job]:
 
 # ── Main scrape entry points ──────────────────────────────────────────────────
 
-def scrape_indeed_rss(query: str, location: str) -> list[Job]:
+def scrape_indeed_rss(query: str, location: str, claude: Any = None) -> list[Job]:
     """
-    Pass 1: Try RSS feed first (free, no proxy).
-    On block, fall back to ScraperAPI HTML scrape.
-    Pass 2: Enrich each job with detail-page fetch for missing fields.
+    Pass 1: RSS feed for job discovery.
+    Pass 2: curl_cffi + Claude enrichment for detail fields.
     """
     rss_url = f"https://jp.indeed.com/rss?q={query}&l={location}&limit={RSS_LIMIT_PER_QUERY}"
 
@@ -525,40 +496,34 @@ def scrape_indeed_rss(query: str, location: str) -> list[Job]:
         response = fetch_url(rss_url, use_proxy=False)
         if response.status_code == 200 and "<rss" in response.text:
             jobs = _dict_jobs_to_domain_jobs(parse_rss(response.text, query, location))
-            return _enrich_jobs(jobs)
-        log.warning(f"[INDEED] RSS blocked for {query}/{location} — trying ScraperAPI")
+            return _enrich_jobs(jobs, claude=claude)
+        log.warning("[INDEED] RSS blocked for %s/%s — trying ScraperAPI", query, location)
     except Exception as e:
-        log.warning(f"[INDEED] RSS failed: {e}")
+        log.warning("[INDEED] RSS failed: %s", e)
 
-    # Fallback to ScraperAPI HTML scrape
     try:
         search_url = f"https://jp.indeed.com/jobs?q={query}&l={location}&limit=50"
         response = fetch_url(search_url, use_proxy=True)
         if response.status_code == 200:
             jobs = _dict_jobs_to_domain_jobs(parse_html(response.text, query, location))
-            return _enrich_jobs(jobs)
-        log.error(f"[INDEED] ScraperAPI also failed: {response.status_code}")
+            return _enrich_jobs(jobs, claude=claude)
+        log.error("[INDEED] ScraperAPI also failed: %d", response.status_code)
     except Exception as e:
-        log.error(f"[INDEED] ScraperAPI failed: {e}")
+        log.error("[INDEED] ScraperAPI failed: %s", e)
 
     return []
 
 
 def _extract_rss_employment_type(desc_html: str) -> str:
-    """Try to find an employment type keyword in an RSS description blob."""
     text = re.sub(r"<[^>]+>", " ", desc_html)
-    for keyword in ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "嘱託"]:
+    for keyword in ["正社員", "パート", "アルバイト", "契約社員", "派遣社員", "業務委託", "非常勤", "嘱託"]:
         if keyword in text:
             return keyword
     return ""
 
 
 def parse_rss(xml_text: str, query: str, location: str) -> list[dict]:
-    """Parse Indeed RSS feed into standard job schema.
-
-    Extracts as many fields as possible from the description HTML to reduce
-    the number of jobs that need an expensive detail-page fetch in Pass 2.
-    """
+    """Parse Indeed RSS feed into standard job schema."""
     jobs: list[dict] = []
     try:
         root = ET.fromstring(xml_text)
@@ -566,154 +531,109 @@ def parse_rss(xml_text: str, query: str, location: str) -> list[dict]:
             title = item.find("title")
             link = item.find("link")
             description = item.find("description")
-
             if not title or not link:
                 continue
-
             desc_html = description.text if description is not None else ""
             desc_text = strip_html(desc_html)
-
             job_id = hashlib.md5(f"indeed_japan|{title.text}|{location}".encode()).hexdigest()
-
-            jobs.append(
-                {
-                    "id": job_id,
-                    "source": "indeed_japan",
-                    "raw_facility": extract_facility(title.text or ""),
-                    "masked_facility": "",
-                    "job_title": clean_title(title.text or ""),
-                    "location": location,
-                    # RSS description is a short snippet — enrich_jobs will
-                    # expand this only if it's still below threshold
-                    "job_description": desc_text[:500],
-                    "requirements": "",
-                    # Pull salary and employment_type from the RSS blob so
-                    # these jobs can skip the detail fetch if that's all
-                    # they're missing (saves ScraperAPI credits)
-                    "salary_raw": extract_salary(desc_html),
-                    "salary_masked": "",
-                    "employment_type": _extract_rss_employment_type(desc_html),
-                    "application_deadline": "",
-                    "contact_information": "",
-                    "url": link.text or "",
-                    "scraped_at": datetime.utcnow().isoformat(),
-                }
-            )
+            jobs.append({
+                "id": job_id,
+                "source": "indeed_japan",
+                "raw_facility": extract_facility(title.text or ""),
+                "masked_facility": "",
+                "job_title": clean_title(title.text or ""),
+                "location": location,
+                "job_description": desc_text[:500],
+                "requirements": "",
+                "salary_raw": extract_salary(desc_html),
+                "salary_masked": "",
+                "employment_type": _extract_rss_employment_type(desc_html),
+                "application_deadline": "",
+                "contact_information": "",
+                "url": link.text or "",
+                "scraped_at": datetime.utcnow().isoformat(),
+            })
     except ET.ParseError as e:
-        log.error(f"[INDEED] RSS parse error: {e}")
-
-    log.info(f"[INDEED] RSS parsed {len(jobs)} jobs for {query}/{location}")
+        log.error("[INDEED] RSS parse error: %s", e)
+    log.info("[INDEED] RSS parsed %d jobs for %s/%s", len(jobs), query, location)
     return jobs
 
 
 def parse_html(html: str, query: str, location: str) -> list[dict]:
-    """
-    Parse Indeed HTML search results via BeautifulSoup.
-    Uses multiple fallback selectors per field to handle Indeed's frequent DOM changes.
-    """
+    """Parse Indeed HTML search results via BeautifulSoup."""
     from bs4 import BeautifulSoup
-
     jobs: list[dict] = []
-
     try:
         soup = BeautifulSoup(html, "html.parser")
-
-        # Multiple fallback card selectors — Indeed changes class names regularly
         job_cards = (
             soup.find_all("div", class_="job_seen_beacon")
             or soup.find_all("div", {"data-testid": "slider_item"})
             or soup.find_all("li", class_=re.compile(r"job", re.I))
             or soup.find_all("div", class_=re.compile(r"jobCard|job-card|resultContent", re.I))
         )
-
-        log.info(f"[INDEED] Found {len(job_cards)} job cards in HTML")
-
+        log.info("[INDEED] Found %d job cards in HTML", len(job_cards))
         for card in job_cards:
-            # Title — multiple fallback selectors
             title_el = (
                 card.find("span", {"data-testid": "jobTitle"})
                 or card.find("span", id=re.compile(r"jobTitle", re.I))
                 or card.find("h2", class_=re.compile(r"jobTitle|job-title", re.I))
                 or card.find("h2")
             )
-
-            # Company name
             company_el = (
                 card.find("span", {"data-testid": "company-name"})
                 or card.find("span", class_=re.compile(r"companyName|company", re.I))
-                or card.find("a", {"data-testid": "company-name"})
             )
-
-            # Location
             location_el = (
                 card.find("div", {"data-testid": "text-location"})
                 or card.find("div", class_=re.compile(r"companyLocation|location", re.I))
-                or card.find("span", class_=re.compile(r"location", re.I))
             )
-
-            # Salary — validate it contains currency markers before storing
             salary_el = (
                 card.find("div", {"data-testid": "attribute_snippet_testid"})
                 or card.find("div", class_=re.compile(r"salary|wage", re.I))
-                or card.find("span", class_=re.compile(r"salary|wage", re.I))
             )
-
-            # Job URL — prefer organic /rc/clk links; avoid /pagead/ ad trackers
             link_el = (
                 card.find("a", {"data-testid": re.compile(r"job|title", re.I)})
                 or card.find("a", href=re.compile(r"/rc/clk|/jobs/", re.I))
                 or card.find("a", href=re.compile(r"jk=", re.I))
                 or card.find("a", href=True)
             )
-
             if not title_el:
                 continue
-
             title_text = title_el.get_text(strip=True)
             if not title_text:
                 continue
-
             salary_text = ""
             if salary_el:
                 raw_salary = salary_el.get_text(strip=True)
                 if any(c in raw_salary for c in ["円", "万", "¥", "時給", "月給", "年収"]):
                     salary_text = raw_salary
-
-            job_id = hashlib.md5(
-                f"indeed_japan|{title_text}|{location}".encode()
-            ).hexdigest()
-
+            job_id = hashlib.md5(f"indeed_japan|{title_text}|{location}".encode()).hexdigest()
             raw_href = link_el["href"] if link_el else ""
             full_url = (
                 f"https://jp.indeed.com{raw_href}"
                 if raw_href and not raw_href.startswith("http")
                 else raw_href
             )
-
-            jobs.append(
-                {
-                    "id": job_id,
-                    "source": "indeed_japan",
-                    "raw_facility": company_el.get_text(strip=True) if company_el else "",
-                    "masked_facility": "",
-                    "job_title": title_text,
-                    "location": location_el.get_text(strip=True) if location_el else location,
-                    # Listing page never has these — detail fetch will populate them
-                    "job_description": "",
-                    "requirements": "",
-                    "salary_raw": salary_text,
-                    "salary_masked": "",
-                    "employment_type": "",
-                    "application_deadline": "",
-                    "contact_information": "",
-                    "url": full_url,
-                    "scraped_at": datetime.utcnow().isoformat(),
-                }
-            )
+            jobs.append({
+                "id": job_id,
+                "source": "indeed_japan",
+                "raw_facility": company_el.get_text(strip=True) if company_el else "",
+                "masked_facility": "",
+                "job_title": title_text,
+                "location": location_el.get_text(strip=True) if location_el else location,
+                "job_description": "",
+                "requirements": "",
+                "salary_raw": salary_text,
+                "salary_masked": "",
+                "employment_type": "",
+                "application_deadline": "",
+                "contact_information": "",
+                "url": full_url,
+                "scraped_at": datetime.utcnow().isoformat(),
+            })
     except Exception as e:
-        log.error(f"[INDEED] HTML parse error: {e}")
-
-    log.info(f"[INDEED] HTML parsed {len(jobs)} jobs")
+        log.error("[INDEED] HTML parse error: %s", e)
+    log.info("[INDEED] HTML parsed %d jobs", len(jobs))
     return jobs
 
 
@@ -743,11 +663,15 @@ def strip_html(html: str) -> str:
     return re.sub(r"<[^>]+>", "", html).strip()
 
 
-async def run() -> list[Job]:
-    """Main entry point called by pipeline."""
+async def run(claude: Any = None) -> list[Job]:
+    """Main entry point called by pipeline. Accepts claude client for enrichment."""
     all_jobs: list[Job] = []
     for query_config in SEARCH_QUERIES:
-        jobs = scrape_indeed_rss(query=query_config["q"], location=query_config["l"])
+        jobs = scrape_indeed_rss(
+            query=query_config["q"],
+            location=query_config["l"],
+            claude=claude,
+        )
         all_jobs.extend(jobs)
-        log.info(f"[INDEED] Total so far: {len(all_jobs)}")
+        log.info("[INDEED] Total so far: %d", len(all_jobs))
     return all_jobs
