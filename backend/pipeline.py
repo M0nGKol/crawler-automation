@@ -434,7 +434,7 @@ async def run_pipeline(
                     last_error = "stopped by user"
                     break
                 try:
-                    fetched_jobs = await safe_scrape(scrapers[0][1](), site_name)
+                    fetched_jobs = await safe_scrape(scrapers[0][1](claude=claude), site_name)
                     if fetched_jobs:
                         scrape_results.append(
                             {
