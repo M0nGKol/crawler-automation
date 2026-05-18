@@ -18,9 +18,9 @@ from scraping.strategies.json_api_scraper import fetch_json_api
 log = logging.getLogger(__name__)
 
 TIMEOUTS = {
-    "default": 60,
-    "hospital_site": 45,
-    "job_board": 90,
+    "default": 300,       # was 60  — must cover Pass 1 fetch + Pass 2 enrichment
+    "hospital_site": 300, # was 45  — 10 detail pages × (fetch + Claude) ≈ 60-120s
+    "job_board": 300,     # was 90  — same reason
 }
 
 MAX_RETRIES = 3

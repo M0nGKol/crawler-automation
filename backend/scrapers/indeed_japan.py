@@ -38,7 +38,7 @@ _ENRICHMENT_FIELDS = ("requirements", "employment_type", "application_deadline",
 
 # ── Fetch helpers ─────────────────────────────────────────────────────────────
 
-def _fetch_with_curl_cffi(url: str) -> str | None:
+def _fetch_with_curl_cffi(url: str) -> tuple[str | None, int | None]:
     """
     Fetch a URL by impersonating Chrome's TLS fingerprint via curl_cffi.
 
@@ -46,7 +46,9 @@ def _fetch_with_curl_cffi(url: str) -> str | None:
     real browsers from bots. curl_cffi replicates Chrome's exact fingerprint
     at the C library level — no browser process, ~15MB RAM, free to run.
 
-    Returns the response text on success, None on any failure.
+    Returns (html, status_code) on any response, (None, None) on exception.
+    Callers must check the status code — a 403 means IP reputation block and
+    ScraperAPI (same server IP) will also fail, so don't waste credits retrying.
     """
     try:
         from curl_cffi import requests as cf_requests
@@ -61,15 +63,15 @@ def _fetch_with_curl_cffi(url: str) -> str | None:
             allow_redirects=True,
         )
         if resp.status_code == 200:
-            return resp.text
+            return resp.text, 200
         log.warning("[INDEED] curl_cffi got status %d for %s", resp.status_code, url[:80])
-        return None
+        return None, resp.status_code
     except ImportError:
         log.warning("[INDEED] curl_cffi not installed — falling back to ScraperAPI")
-        return None
+        return None, None
     except Exception as exc:
         log.warning("[INDEED] curl_cffi fetch failed for %s: %s", url[:80], exc)
-        return None
+        return None, None
 
 
 def fetch_url(url: str, use_proxy: bool = False, render_js: bool = False) -> requests.Response:
@@ -272,10 +274,17 @@ def _enrich_job_from_detail(job: Job, claude: Any = None) -> bool:
     html: str = ""
 
     # ── Attempt 1: curl_cffi Chrome impersonation (free) ─────────────────────
-    fetched_html = _fetch_with_curl_cffi(canonical_url)
+    fetched_html, curl_status = _fetch_with_curl_cffi(canonical_url)
     if fetched_html and _is_valid_job_page(fetched_html):
         html = fetched_html
         log.info("[INDEED] Detail OK via curl_cffi: %s", canonical_url[:60])
+    elif curl_status == 403:
+        # 403 = Cloudflare IP reputation block on our server's IP address.
+        # curl_cffi fixes TLS fingerprinting but cannot change IP reputation.
+        # ScraperAPI standard tier runs on the same datacenter IP range and
+        # will hit the same 403 — skip it entirely to avoid burning credits.
+        log.warning("[INDEED] IP blocked by Cloudflare (403) — skipping ScraperAPI, saving credits: %s", canonical_url[:60])
+        return False
     else:
         # ── Attempt 2: ScraperAPI render=false (1 credit) ────────────────────
         if SCRAPERAPI_KEY:
